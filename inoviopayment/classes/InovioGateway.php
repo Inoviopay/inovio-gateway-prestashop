@@ -87,8 +87,9 @@ class InovioGateway
 
         $descriptor = trim((string) Configuration::get('INOVIOPAYMENT_DESCRIPTOR'));
         if ($descriptor !== '') {
-            $d = new Descriptor();
-            $d->name = $descriptor;
+            // The name is a CONSTRUCTOR argument — it is required, and passing
+            // it there is also what triggers the SDK's character validation.
+            $d = new Descriptor($descriptor);
             $phone = trim((string) Configuration::get('INOVIOPAYMENT_DESCRIPTOR_PHONE'));
             $d->phone = $phone !== '' ? $phone : null;
             $req->descriptor = $d;
