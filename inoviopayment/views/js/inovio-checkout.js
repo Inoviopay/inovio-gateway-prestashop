@@ -207,10 +207,17 @@
     function mintToken(pan, cvv) {
         var uid = randomHex(32);
 
+        // The signature endpoint is CSRF-guarded and cart-bound, so send the
+        // PrestaShop token from the form and include session cookies.
+        var tokenField = document.querySelector('#inovio-payment-form [name="inovio_token"]'),
+            payload = 'uniqueId=' + encodeURIComponent(uid) +
+                '&inovio_token=' + encodeURIComponent(tokenField ? tokenField.value : '');
+
         return fetch(cfg().signatureUrl, {
             method: 'POST',
             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: 'uniqueId=' + encodeURIComponent(uid)
+            credentials: 'same-origin',
+            body: payload
         }).then(function (resp) {
             if (!resp.ok) {
                 throw new Error('signature');
@@ -544,76 +551,6 @@
      * @param {HTMLFormElement} form
      */
     /**
-     * The submit interception itself. Shared by the document-level capture
-     * listener and by bindForm(), so the behaviour is identical however the
-     * submit reaches us.
-     *
-     * The "already tokenized" guard lives on the form ELEMENT rather than in a
-     * closure: PrestaShop can re-render the payment step, and a closure flag
-     * would be lost (or worse, stale) across renders.
-     *
-     * @param {HTMLFormElement} form
-     * @param {Event} e
-     */
-    function handleSubmit(form, e) {
-        var submitBtn = findSubmitButton(form);
-
-        if (form.dataset.inovioSubmitted === 'true') {
-            // Second pass — let PrestaShop's own controller handle it.
-            return;
-        }
-
-        (function (e) {
-            e.preventDefault();
-            e.stopPropagation();
-            clearError();
-
-            var panField = field(form, 'inovio_card_number'),
-                monthField = field(form, 'inovio_exp_month'),
-                yearField = field(form, 'inovio_exp_year'),
-                cvvField = field(form, 'inovio_cvv'),
-                saveCardField = form.querySelector('[name="inovio_save_card_input"]'),
-                pan = normalizePan(panField ? panField.value : ''),
-                month = monthField ? monthField.value : '',
-                year = yearField ? yearField.value : '',
-                cvv = cvvField ? cvvField.value : '',
-                validationError = validate({pan: pan, month: month, year: year, cvv: cvv});
-
-            if (validationError) {
-                showError(validationError, form);
-
-                return;
-            }
-
-            setBusy(submitBtn, true, translate('processing', 'Processing payment…'));
-
-            tokenizeFlow({pan: pan, cvv: cvv}).then(function (result) {
-                setHidden(form, 'inovio_token_guid', result.tokenGuid);
-                setHidden(form, 'inovio_token_guid_completion', result.tokenGuidCompletion);
-                setHidden(form, 'inovio_pmt_expiry', month + year);
-                setHidden(form, 'inovio_cc_brand', cardBrand(pan));
-                setHidden(form, 'inovio_cc_last4', pan.slice(-4));
-                setHidden(form, 'inovio_ddc_reference_id', result.ddcReferenceId);
-                setHidden(form, 'inovio_browser', result.browserData ? JSON.stringify(result.browserData) : '');
-                setHidden(form, 'inovio_save_card',
-                    saveCardField && saveCardField.checked ? 'true' : 'false');
-
-                form.dataset.inovioSubmitted = 'true';
-                setBusy(submitBtn, false);
-
-                if (typeof form.requestSubmit === 'function') {
-                    form.requestSubmit(submitBtn || undefined);
-                } else {
-                    form.submit();
-                }
-            }).catch(function (message) {
-                setBusy(submitBtn, false);
-                showError(String(message), form);
-            });
-        }(e));
-    }
-
-    /**
      * Per-form setup. The submit interception is handled at the document
      * level (see the bottom of this file), so this only marks the form as
      * seen; it is kept as a named step for clarity and future per-form work.
@@ -621,6 +558,116 @@
      */
     function bindForm(form) {
         form.dataset.inovioBound = 'true';
+    }
+
+    /*
+     * How the submit is intercepted.
+     *
+     * MEASURED IN A BROWSER (PrestaShop 9 + jQuery 3, 2026-08-28) — each fact
+     * below was tested on a live page, not assumed:
+     *
+     *  1. The theme confirms the order with, literally:
+     *         $(`#pay-with-${option}-form form`).submit()
+     *     (read from Hummingbird's own checkout bundle).
+     *  2. jQuery's .submit() runs jQuery-bound handlers ONLY. A native
+     *     addEventListener('submit', ...) never fires for it — any phase, form
+     *     or document. A native listener therefore cannot intercept checkout.
+     *  3. Inside a jQuery-delegated 'submit' handler, e.preventDefault() DOES
+     *     stop the submission (isDefaultPrevented === true).
+     *  4. HTMLFormElement.prototype.submit.call(form) submits WITHOUT running
+     *     jQuery handlers — the escape hatch for continuing once we're done.
+     *
+     * Hence: bind through jQuery, preventDefault, run the async tokenize
+     * chain, then submit natively so we don't re-enter this handler.
+     *
+     * The Place Order button is deliberately NOT touched: it belongs to no
+     * form (its .form is null) and cancelling its click also cancels
+     * PrestaShop's own payment-option handling, collapsing the form.
+     */
+    function onPaymentFormSubmit(form, e) {
+        if (form.dataset.inovioSubmitted === 'true') {
+            return;
+        }
+
+        e.preventDefault();
+        clearError();
+
+        var panField = field(form, 'inovio_card_number'),
+            monthField = field(form, 'inovio_exp_month'),
+            yearField = field(form, 'inovio_exp_year'),
+            cvvField = field(form, 'inovio_cvv'),
+            saveCardField = form.querySelector('[name="inovio_save_card_input"]'),
+            savedCardRadio = form.querySelector('[name="inovio_saved_card_id"]:checked'),
+            submitBtn = findSubmitButton(form),
+            pan = normalizePan(panField ? panField.value : ''),
+            month = monthField ? monthField.value : '',
+            year = yearField ? yearField.value : '',
+            cvv = cvvField ? cvvField.value : '',
+            validationError;
+
+        // A stored card needs no tokenization — send it straight through.
+        if (savedCardRadio && savedCardRadio.value) {
+            submitForReal(form);
+
+            return;
+        }
+
+        validationError = validate({pan: pan, month: month, year: year, cvv: cvv});
+
+        if (validationError) {
+            showError(validationError, form);
+            setBusy(submitBtn, false);
+
+            return;
+        }
+
+        setBusy(submitBtn, true, translate('processing', 'Processing payment\u2026'));
+
+        tokenizeFlow({pan: pan, cvv: cvv}).then(function (result) {
+            setHidden(form, 'inovio_token_guid', result.tokenGuid);
+            setHidden(form, 'inovio_token_guid_completion', result.tokenGuidCompletion);
+            setHidden(form, 'inovio_pmt_expiry', month + year);
+            setHidden(form, 'inovio_cc_brand', cardBrand(pan));
+            setHidden(form, 'inovio_cc_last4', pan.slice(-4));
+            setHidden(form, 'inovio_ddc_reference_id', result.ddcReferenceId);
+            setHidden(form, 'inovio_browser', result.browserData ? JSON.stringify(result.browserData) : '');
+            setHidden(form, 'inovio_save_card',
+                saveCardField && saveCardField.checked ? 'true' : 'false');
+
+            // The PAN and CVV must never reach our server: clear them from the
+            // DOM before the form is posted.
+            if (panField) { panField.value = ''; }
+            if (cvvField) { cvvField.value = ''; }
+
+            setBusy(submitBtn, false);
+            submitForReal(form);
+        }).catch(function (message) {
+            setBusy(submitBtn, false);
+            showError(String(message), form);
+        });
+    }
+
+    /**
+     * Submit bypassing every handler (jQuery's included), so the tokenized
+     * form posts exactly once.
+     * @param {HTMLFormElement} form
+     */
+    function submitForReal(form) {
+        form.dataset.inovioSubmitted = 'true';
+        HTMLFormElement.prototype.submit.call(form);
+    }
+
+    if (typeof window.jQuery === 'function') {
+        window.jQuery(document).on('submit', '#inovio-payment-form', function (e) {
+            onPaymentFormSubmit(this, e);
+        });
+    } else {
+        // No jQuery (non-standard theme): fall back to the native event.
+        document.addEventListener('submit', function (e) {
+            if (e.target && e.target.id === 'inovio-payment-form') {
+                onPaymentFormSubmit(e.target, e);
+            }
+        }, true);
     }
 
     /**
@@ -644,211 +691,6 @@
         bindForm(form);
         INOVIO_INITIALIZED = true;
     }
-
-    /*
-     * Binding strategy.
-     *
-     * VERIFIED IN A BROWSER (PrestaShop 9, Hummingbird theme, 2026-08-28):
-     * the payment form does not exist at DOMContentLoaded OR at window.load.
-     * PrestaShop renders the checkout on step 1 and only injects the payment
-     * options when the shopper reaches step 4, so an init() bound to either
-     * event finds no form and never wires anything up — the order then posts
-     * with no token and the server correctly refuses it.
-     *
-     * PrestaShop also exposes no order-submission event to hook (the whole
-     * documented bus was checked: updateCart/updatedCart/changedCheckoutStep/
-     * updatedDeliveryForm/termsUpdated/orderConfirmationErrors/… — none fire
-     * on placement).
-     *
-     * So we bind ONCE at the document level, in the capture phase. The
-     * listener survives any re-render of the payment step because it is not
-     * attached to the form at all; it simply checks whether the submitted
-     * form is ours. A MutationObserver additionally runs init() when the form
-     * finally appears, so per-form setup still happens exactly once.
-     */
-    function documentSubmitHandler(e) {
-        var form = e.target;
-
-        if (!form || form.id !== 'inovio-payment-form') {
-            return;
-        }
-
-        // Delegate to the same interception used when binding directly.
-        handleSubmit(form, e);
-    }
-
-    document.addEventListener('submit', documentSubmitHandler, true);
-
-    /*
-     * PrestaShop submits the payment form with jQuery, not natively.
-     *
-     * VERIFIED by reading the Hummingbird theme's own checkout bundle
-     * (2026-08-28). Its confirm() handler ends with:
-     *
-     *     $(`#pay-with-${option}-form form`).submit()
-     *
-     * jQuery's .submit() triggers jQuery-bound handlers ONLY — it does not
-     * dispatch an event that native addEventListener('submit') handlers can
-     * see. That is why a native listener (any phase, document or form) never
-     * fires on a real "Place Order" click, and why the order posted with no
-     * token until this handler was added.
-     *
-     * So when jQuery is present (the theme always loads it) we bind through
-     * jQuery as well, and that is the path that actually runs in production.
-     */
-    if (typeof window.jQuery === 'function') {
-        window.jQuery(document).on('submit', '#inovio-payment-form', function (e) {
-            handleSubmit(this, e);
-        });
-    }
-
-    /*
-     * ⚠️ KNOWN GAP — browser checkout is NOT yet working end to end.
-     *
-     * Status as of 2026-08-28, established by testing in a real browser
-     * against PrestaShop 9 + Hummingbird:
-     *
-     *   - Everything on the server side is proven: the signature endpoint
-     *     returns a valid HMAC to the browser (200), and a browser-direct POST
-     *     of the PAN to token_service.cfm returns a real TOKEN_GUID. Both were
-     *     executed from this page.
-     *   - The theme submits with jQuery: `$('#pay-with-<opt>-form form').submit()`.
-     *     A native addEventListener('submit') never sees that, and the Place
-     *     Order button is not associated with any form (its .form is null), so
-     *     a button-click interceptor cancels PrestaShop's own option handling
-     *     and collapses the form.
-     *   - With the jQuery binding above the form DOES submit and reaches our
-     *     validation controller, but it posts BEFORE the async tokenize chain
-     *     resolves, so `inovio_token_guid` is empty and the controller
-     *     correctly refuses with "Payment token is missing".
-     *
-     * The remaining work is to make the submit wait for tokenization: cancel
-     * the first jQuery submit, run the chain, then re-trigger the theme's own
-     * submit path once the hidden inputs are populated. jQuery's
-     * event.preventDefault() inside a delegated 'submit' handler does stop
-     * .submit(), so this is a solvable sequencing problem, not a dead end.
-     *
-     * The server side refusing an untokenized order is correct behaviour and
-     * should not be relaxed to make checkout "work".
-     */
-
-    /*
-     * The "Place Order" button is NOT part of our form.
-     *
-     * VERIFIED IN A BROWSER (PrestaShop 9, Hummingbird theme, 2026-08-28):
-     * the button is `type="submit"` but its `.form` is null and it lives
-     * OUTSIDE the payment form — PrestaShop's own checkout JS submits the
-     * selected option's form programmatically. A native `submit` event
-     * therefore never fires on our form from a real click, so a submit
-     * listener alone (any phase, any element) can never intercept checkout.
-     *
-     * We therefore also intercept the BUTTON CLICK in the capture phase, run
-     * the tokenize/3DS chain, and only then re-issue the click — at which
-     * point PrestaShop submits the form with our hidden inputs populated.
-     */
-    function isPlaceOrderButton(el) {
-        if (!el || !el.closest) {
-            return null;
-        }
-
-        var btn = el.closest('button, input[type="submit"]'),
-            form = document.getElementById('inovio-payment-form');
-
-        if (!btn || !form || form.offsetParent === null) {
-            return null;
-        }
-
-        // Don't hijack clicks inside our own form.
-        if (form.contains(btn)) {
-            return null;
-        }
-
-        return (btn.closest('#checkout-payment-step') || btn.closest('#payment-confirmation'))
-            ? btn
-            : null;
-    }
-
-    /**
-     * Run the tokenize/3DS chain, populate the hidden inputs, then re-issue
-     * the click so PrestaShop's own checkout code submits the form.
-     * @param {HTMLFormElement} form
-     * @param {HTMLElement} btn
-     */
-    function runTokenizeAndContinue(form, btn) {
-        var panField = field(form, 'inovio_card_number'),
-            monthField = field(form, 'inovio_exp_month'),
-            yearField = field(form, 'inovio_exp_year'),
-            cvvField = field(form, 'inovio_cvv'),
-            saveCardField = form.querySelector('[name="inovio_save_card_input"]'),
-            savedCardRadio = form.querySelector('[name="inovio_saved_card_id"]:checked'),
-            pan = normalizePan(panField ? panField.value : ''),
-            month = monthField ? monthField.value : '',
-            year = yearField ? yearField.value : '',
-            cvv = cvvField ? cvvField.value : '',
-            validationError;
-
-        clearError();
-
-        // Paying with a stored card needs no tokenization at all.
-        if (savedCardRadio && savedCardRadio.value) {
-            form.dataset.inovioSubmitted = 'true';
-            btn.click();
-
-            return;
-        }
-
-        validationError = validate({pan: pan, month: month, year: year, cvv: cvv});
-
-        if (validationError) {
-            showError(validationError, form);
-
-            return;
-        }
-
-        setBusy(btn, true, translate('processing', 'Processing payment…'));
-
-        tokenizeFlow({pan: pan, cvv: cvv}).then(function (result) {
-            setHidden(form, 'inovio_token_guid', result.tokenGuid);
-            setHidden(form, 'inovio_token_guid_completion', result.tokenGuidCompletion);
-            setHidden(form, 'inovio_pmt_expiry', month + year);
-            setHidden(form, 'inovio_cc_brand', cardBrand(pan));
-            setHidden(form, 'inovio_cc_last4', pan.slice(-4));
-            setHidden(form, 'inovio_ddc_reference_id', result.ddcReferenceId);
-            setHidden(form, 'inovio_browser', result.browserData ? JSON.stringify(result.browserData) : '');
-            setHidden(form, 'inovio_save_card',
-                saveCardField && saveCardField.checked ? 'true' : 'false');
-
-            form.dataset.inovioSubmitted = 'true';
-            setBusy(btn, false);
-            btn.click();
-        }).catch(function (message) {
-            setBusy(btn, false);
-            showError(String(message), form);
-        });
-    }
-
-    /*
-     * NOTE (2026-08-28): a capture-phase click interceptor on the Place Order
-     * button was tried here and REMOVED. Cancelling that click also cancels
-     * PrestaShop's own payment-option handling, which collapses the selected
-     * option and hides the form. The jQuery submit binding above is the
-     * correct hook; keep interception there, not on the button.
-     *
-     * `isPlaceOrderButton` / `runTokenizeAndContinue` are retained because the
-     * jQuery path reuses the same tokenize-then-continue logic.
-     */
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
-    }
-
-    window.addEventListener('load', function () {
-        if (!INOVIO_INITIALIZED) {
-            init();
-        }
-    });
 
     /*
      * The payment step is injected late, so watch for it — but do so cheaply:

@@ -320,9 +320,11 @@ class Inoviopayment extends PaymentModule
 
         $this->context->smarty->assign([
             'inovioReference' => $order->reference,
-            'inovioTotal' => Tools::displayPrice(
-                $order->getOrdersTotalPaid(),
-                new Currency((int) $order->id_currency)
+            // PrestaShop 9 removed Tools::displayPrice(); format through the
+            // context locale instead.
+            'inovioTotal' => Tools::getContextLocale($this->context)->formatPrice(
+                (float) $order->getOrdersTotalPaid(),
+                (new Currency((int) $order->id_currency))->iso_code
             ),
             'inovioStatus' => $order->getCurrentStateFull((int) $this->context->language->id)['name'] ?? '',
         ]);
