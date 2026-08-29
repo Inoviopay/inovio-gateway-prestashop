@@ -1,0 +1,7 @@
+#inovio-errors { margin-bottom: 1rem; }
+.inovio-saved-cards { margin-bottom: 1rem; }
+.inovio-processing { opacity: .6; pointer-events: none; }
+#inovio-3ds-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  z-index: 9999; display: flex; align-items: center; justify-content: center;
+}

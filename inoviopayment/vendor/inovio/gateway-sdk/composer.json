@@ -1,0 +1,16 @@
+{
+  "name": "inovio/gateway-sdk",
+  "description": "Inovio Gateway Payments Service SDK (PHP)",
+  "type": "library",
+  "license": "proprietary",
+  "require": {
+    "php": ">=8.0",
+    "ext-json": "*",
+    "ext-bcmath": "*",
+    "ext-curl": "*"
+  },
+  "autoload": {
+    "classmap": ["src/"]
+  },
+  "config": { "sort-packages": true }
+}
