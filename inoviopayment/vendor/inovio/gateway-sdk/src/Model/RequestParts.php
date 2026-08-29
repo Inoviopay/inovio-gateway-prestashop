@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Inovio\Gateway\Model;
 
+use Inovio\Gateway\Errors\ValidationException;
+
 /** CUST_* + XTL_IP */
 final class Customer
 {
@@ -54,11 +56,32 @@ final class LineItem
 /** PMT_DESCRIPTOR* */
 final class Descriptor
 {
+    /**
+     * Characters the gateway accepts in PMT_DESCRIPTOR.
+     *
+     * Empirical, not from the spec: mapped 2026-08-29 by sending each
+     * candidate in an otherwise-identical approved request. SPACE, UNDERSCORE
+     * and FORWARD SLASH are rejected and fail the ENTIRE transaction with
+     * "Invalid Data"; hyphen, dot, asterisk, plus, ampersand, at, digits and
+     * mixed case all pass.
+     *
+     * Space matters most: a multi-word descriptor ("ACME STORE") is the
+     * natural thing for a merchant to configure, and it kills every sale.
+     */
+    public const ALLOWED_NAME = '/^[A-Za-z0-9.\-*+&@]+$/';
+
     public ?string $phone = null;
     public ?string $city = null;
 
     public function __construct(public string $name)
     {
+        if ($name !== '' && !preg_match(self::ALLOWED_NAME, $name)) {
+            throw new ValidationException(
+                'descriptor may not contain spaces, underscores or slashes: ' . $name,
+                null,
+                'PMT_DESCRIPTOR'
+            );
+        }
     }
 }
 
