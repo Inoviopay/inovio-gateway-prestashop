@@ -130,7 +130,6 @@ test('Vault IDOR: shopper B cannot pay with shopper A\'s saved card', async ({ p
 
   // Baseline: count orders/transactions before the attack attempt, so we
   // can prove nothing new got charged against A's card.
-  const ordersBeforeAttack = queryDb('SELECT COUNT(*) FROM ps_orders');
 
   // --- Shopper B: separate browser context (own cookies/session). -------
   const contextB = await browser.newContext();
@@ -144,6 +143,13 @@ test('Vault IDOR: shopper B cannot pay with shopper A\'s saved card', async ({ p
     const idCustomerB = queryDb(`SELECT id_customer FROM ps_customer WHERE email='${SHOPPER_B.email}'`);
     expect(Number(idCustomerB)).toBeGreaterThan(0);
     expect(Number(idCustomerB)).not.toBe(Number(idCustomerA));
+
+    // B's cart — the one the attack is attempted against. Scoping the final
+    // assertion to this cart keeps it meaningful on a shop shared with the
+    // rest of the suite, where other specs create orders concurrently.
+    const idCartB = queryDb(
+      `SELECT IFNULL(MAX(id_cart),0) FROM ps_cart WHERE id_customer=${Number(idCustomerB)}`
+    );
 
     await ck.emptyCart(pageB);
     await ck.addProduct(pageB);
@@ -203,12 +209,19 @@ test('Vault IDOR: shopper B cannot pay with shopper A\'s saved card', async ({ p
     await expect(pageB.locator('body')).toContainText(/could not be processed|error|try again/i);
     await shotB(pageB, 'shopper-b-refused-with-error');
 
-    // No new order should exist at all from this attempt.
-    const ordersAfterAttack = queryDb('SELECT COUNT(*) FROM ps_orders');
-    expect(ordersAfterAttack).toBe(ordersBeforeAttack);
+    // No order must exist for the cart B attacked with.
+    //
+    // NOTE: do NOT assert on a global COUNT(*) of ps_orders here. This shop is
+    // shared with the rest of the suite, so other specs legitimately create
+    // orders while this one runs — a global count is flaky by construction and
+    // says nothing about whether the attack succeeded. Scope it to B instead.
+    const ordersForAttackedCart = queryDb(
+      `SELECT COUNT(*) FROM ps_orders WHERE id_cart=${Number(idCartB)}`
+    );
+    expect(ordersForAttackedCart, 'no order may exist for the attacked cart').toBe('0');
 
     // And specifically: no order in the system should have been placed by
-    // shopper B (defence in depth beyond the raw count check above).
+    // shopper B (defence in depth beyond the cart-scoped check above).
     const idCustomerBNum = Number(idCustomerB);
     const bOrders = queryDb(`SELECT COUNT(*) FROM ps_orders WHERE id_customer=${idCustomerBNum}`);
     expect(bOrders).toBe('0');

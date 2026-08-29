@@ -1,6 +1,6 @@
 # PrestaShop module — e2e evidence
 
-Generated: 2026-08-29 07:10:54
+Generated: 2026-08-29 09:05:33
 
 Every screenshot below was produced by Playwright driving the real
 storefront and back office as a shopper/merchant would: navigating,
@@ -128,6 +128,20 @@ into the module, no POSTs to its own controllers.
 ### 04-after-void
 
 ![04-after-void](07-void/04-after-void.png)
+
+## 08-decline
+
+### 01-cart-at-trigger-total
+
+![01-cart-at-trigger-total](08-decline/01-cart-at-trigger-total.png)
+
+### 02-card-entered
+
+![02-card-entered](08-decline/02-card-entered.png)
+
+### 03-decline-message
+
+![03-decline-message](08-decline/03-decline-message.png)
 
 ## 08-refund
 

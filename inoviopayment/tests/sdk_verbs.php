@@ -75,5 +75,11 @@ if ($s6->savedCardRef?->pmtId() && $s6->customerRef?->custId()) {
 } else { echo "6b saved-card: NO REFS RETURNED\n"; }
 
 // 7. DECLINE path
-try { show("7 decline probe",$c->sale(req(mintToken(),"0.05"))); }
+// Decline: merch_acct 1602 routes to proc_id 10 ("Test Processor",
+// testbank_drv), a simulator that decides from the WHOLE amount matched
+// exactly against a list in testbank.cfc:284 — 6.35 => 635 Insufficient
+// Funds, 5.06 => 506 Fraud, etc. The response code is the amount without
+// the dot. (0.05 is NOT in that list and approves; the old "$0.05 decline"
+// note was wrong.) PAN/expiry/CVV are not consulted for this decision.
+try { show("7 decline probe",$c->sale(req(mintToken(),"6.35"))); }
 catch (\Throwable $e) { echo "7 decline probe            EXCEPTION: ".substr($e->getMessage(),0,70)."\n"; }
