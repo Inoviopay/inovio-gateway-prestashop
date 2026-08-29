@@ -17,6 +17,12 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+# Some admin back-office full-page screenshots (dev-mode debug output makes
+# the page very tall) legitimately exceed Pillow's default decompression-bomb
+# guard. These are our own trusted evidence screenshots, not untrusted input,
+# so raising the limit here is safe.
+Image.MAX_IMAGE_PIXELS = None
+
 W, H, BAR = 1280, 900, 64
 SECS = float(os.environ.get("SECS", "2.5"))
 ROOT = Path(__file__).parent

@@ -1,6 +1,6 @@
 # PrestaShop module — e2e evidence
 
-Generated: 2026-08-29 09:05:33
+Generated: 2026-08-29 09:23:36
 
 Every screenshot below was produced by Playwright driving the real
 storefront and back office as a shopper/merchant would: navigating,

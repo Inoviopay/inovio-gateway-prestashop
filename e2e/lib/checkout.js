@@ -33,7 +33,29 @@ export function shotter(caseName) {
   return async (page, label) => {
     n += 1;
     const file = path.join(dir, `${String(n).padStart(2, '0')}-${label}.png`);
-    await page.screenshot({ path: file, fullPage: true });
+    /*
+     * Full-page, but capped.
+     *
+     * PrestaShop's back office in dev mode renders pages up to ~147,000px
+     * tall (the debug bar dumps every query), which trips Pillow's
+     * decompression-bomb guard and, more importantly, makes the screenshot
+     * useless as evidence — the actual UI is a sliver at the top. Clip to a
+     * generous viewport-multiple instead so the shot stays readable.
+     */
+    const MAX_SHOT_HEIGHT = 4000;
+    const height = await page.evaluate(
+      () => document.documentElement.scrollHeight
+    ).catch(() => MAX_SHOT_HEIGHT);
+
+    if (height > MAX_SHOT_HEIGHT) {
+      const width = page.viewportSize()?.width ?? 1280;
+      await page.screenshot({
+        path: file,
+        clip: {x: 0, y: 0, width, height: MAX_SHOT_HEIGHT},
+      });
+    } else {
+      await page.screenshot({ path: file, fullPage: true });
+    }
 
     return file;
   };
