@@ -204,7 +204,13 @@ class Inoviopayment extends PaymentModule
 
     public function hookActionFrontControllerSetMedia(): void
     {
-        if ($this->context->controller->php_self !== 'order' || !$this->isConfigured()) {
+        // The checkout JS is needed on the checkout page AND on this module's
+        // own 3DS challenge page (rendered by the validation controller),
+        // which calls window.inovioRunChallenge to open the ACS iframe.
+        $selfs = ['order', 'module-inoviopayment-validation'];
+        if (!in_array((string) $this->context->controller->php_self, $selfs, true)
+            || !$this->isConfigured()
+        ) {
             return;
         }
 

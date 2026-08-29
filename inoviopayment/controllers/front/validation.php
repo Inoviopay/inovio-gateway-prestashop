@@ -17,6 +17,8 @@ use Inovio\Gateway\Result\TransactionResult;
 class InoviopaymentValidationModuleFrontController extends ModuleFrontController
 {
     public $ssl = true;
+    /** Explicit so the module's media hook can load the checkout JS here too. */
+    public $php_self = 'module-inoviopayment-validation';
 
     public function postProcess(): void
     {
@@ -205,11 +207,20 @@ class InoviopaymentValidationModuleFrontController extends ModuleFrontController
     /** Renders the ACS challenge; the module JS drives the iframe. */
     private function renderChallenge(TransactionResult $result): void
     {
+        $cart = $this->context->cart;
+        $customer = new Customer((int) $cart->id_customer);
+
         $this->context->smarty->assign([
             'inovioChallenge' => json_encode([
                 'redirectUrl' => $result->nextAction->redirectUrl ?? '',
                 'jwt' => $result->nextAction->jwt ?? '',
             ]),
+            // The resume form needs these to reach order-confirmation once the
+            // cardholder finishes the challenge.
+            'inovioCartId' => (int) $cart->id,
+            'inovioModuleId' => (int) $this->module->id,
+            'inovioSecureKey' => $customer->secure_key,
+            'inovioConfirmUrl' => $this->context->link->getPageLink('order-confirmation', true),
         ]);
         $this->setTemplate('module:inoviopayment/views/templates/front/threeds_challenge.tpl');
     }

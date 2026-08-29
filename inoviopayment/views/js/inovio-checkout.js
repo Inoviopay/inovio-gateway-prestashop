@@ -46,6 +46,18 @@
     // ------------------------------------------------------------------
 
     /**
+     * The PrestaShop CSRF token our own front controllers require. Every call
+     * to a module endpoint must carry it, or the controller answers 403
+     * invalid_token.
+     * @returns {string}
+     */
+    function csrfToken() {
+        var tokenField = document.querySelector('#inovio-payment-form [name="inovio_token"]');
+
+        return tokenField ? tokenField.value : '';
+    }
+
+    /**
      * Strip whitespace/dashes from a raw card number input.
      * @param {string} raw
      * @returns {string}
@@ -207,11 +219,10 @@
     function mintToken(pan, cvv) {
         var uid = randomHex(32);
 
-        // The signature endpoint is CSRF-guarded and cart-bound, so send the
-        // PrestaShop token from the form and include session cookies.
-        var tokenField = document.querySelector('#inovio-payment-form [name="inovio_token"]'),
-            payload = 'uniqueId=' + encodeURIComponent(uid) +
-                '&inovio_token=' + encodeURIComponent(tokenField ? tokenField.value : '');
+        // Our front controllers are CSRF-guarded and cart-bound, so send the
+        // PrestaShop token and include session cookies.
+        var payload = 'uniqueId=' + encodeURIComponent(uid) +
+                '&inovio_token=' + encodeURIComponent(csrfToken());
 
         return fetch(cfg().signatureUrl, {
             method: 'POST',
@@ -320,7 +331,9 @@
         return fetch(cfg().prepareUrl, {
             method: 'POST',
             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: 'bin=' + encodeURIComponent(bin)
+            credentials: 'same-origin',
+            body: 'bin=' + encodeURIComponent(bin) +
+                '&inovio_token=' + encodeURIComponent(csrfToken())
         }).then(function (resp) {
             return resp.json();
         }).then(function (ddc) {

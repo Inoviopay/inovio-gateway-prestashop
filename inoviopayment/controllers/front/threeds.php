@@ -16,6 +16,9 @@ class InoviopaymentThreedsModuleFrontController extends ModuleFrontController
         header('Content-Type: application/json');
 
         if (!hash_equals(Tools::getToken(false), (string) Tools::getValue('inovio_token'))) {
+            // Log it: a silent refusal here means the 3DS block never gets
+            // attached and the transaction quietly proceeds WITHOUT 3DS.
+            InovioGateway::log('3DS prepare refused: invalid_token', true);
             http_response_code(403);
             $this->ajaxRender((string) json_encode(['error' => 'invalid_token']));
             exit;
