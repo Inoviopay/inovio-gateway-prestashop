@@ -432,8 +432,22 @@ class Inoviopayment extends PaymentModule
                 $raw = trim((string) Tools::getValue('inovio_capture_amount'));
                 $amount = $raw === '' ? null : number_format((float) $raw, 2, '.', '');
                 $result = InovioGateway::captureOrder($order, $amount);
-                $newState = (int) Configuration::get('PS_OS_PAYMENT');
-                $ok = $this->trans('Payment captured.', [], 'Modules.Inoviopayment.Admin');
+
+                /*
+                 * A PARTIAL capture must leave the order in "Awaiting capture"
+                 * so the remainder can still be taken (design doc §3.1). Only a
+                 * full capture moves it to Payment accepted. Comparing against
+                 * the order total — blank amount means "capture everything".
+                 */
+                $isPartial = $amount !== null
+                    && (float) $amount + 0.001 < (float) $order->total_paid;
+
+                $newState = $isPartial
+                    ? (int) Configuration::getGlobalValue(self::STATE_AWAITING_CAPTURE)
+                    : (int) Configuration::get('PS_OS_PAYMENT');
+                $ok = $isPartial
+                    ? $this->trans('Partial payment captured; the order remains open for the balance.', [], 'Modules.Inoviopayment.Admin')
+                    : $this->trans('Payment captured.', [], 'Modules.Inoviopayment.Admin');
             }
 
             if (!InovioGateway::isApproved($result)) {
@@ -443,10 +457,15 @@ class Inoviopayment extends PaymentModule
                 );
             }
 
-            $history = new OrderHistory();
-            $history->id_order = (int) $order->id;
-            $history->changeIdOrderState($newState, (int) $order->id);
-            $history->add();
+            // A partial capture leaves the order in the state it is already in,
+            // so there is no transition to record — skip the history write
+            // rather than logging a no-op state change.
+            if ($newState !== (int) $order->getCurrentState()) {
+                $history = new OrderHistory();
+                $history->id_order = (int) $order->id;
+                $history->changeIdOrderState($newState, (int) $order->id);
+                $history->add();
+            }
 
             return $this->displayConfirmation($ok);
         } catch (\Throwable $e) {
