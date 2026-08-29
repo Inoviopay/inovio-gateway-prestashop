@@ -205,8 +205,31 @@ class InoviopaymentValidationModuleFrontController extends ModuleFrontController
     }
 
     /** Renders the ACS challenge; the module JS drives the iframe. */
+    /**
+     * Stash the challenge for initContent().
+     *
+     * setTemplate() must NOT be called from postProcess(): PrestaShop runs
+     * postProcess() BEFORE setMedia()/initContent(), so a template set here
+     * renders with no theme assets and no module JS — which meant
+     * window.inovioRunChallenge was undefined and the ACS iframe never opened.
+     */
     private function renderChallenge(TransactionResult $result): void
     {
+        $this->challengeResult = $result;
+    }
+
+    /** @var TransactionResult|null set by renderChallenge() during postProcess() */
+    private $challengeResult = null;
+
+    public function initContent(): void
+    {
+        parent::initContent();
+
+        if ($this->challengeResult === null) {
+            return;
+        }
+
+        $result = $this->challengeResult;
         $cart = $this->context->cart;
         $customer = new Customer((int) $cart->id_customer);
 
