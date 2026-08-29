@@ -35,6 +35,12 @@ test('Back office: order detail shows Inovio gateway references', async ({ page 
   // The module's own panel must render with real gateway references.
   await expect(page.locator('#inovio-order-panel')).toBeVisible();
   await expect(page.locator('#inovio-order-panel')).toContainText(/Gateway order/i);
+
+  // Scope this shot to the panel: dev mode makes the full admin page ~23000px
+  // tall, which renders the panel unreadable in a full-page capture.
+  await page.locator('#inovio-order-panel').screenshot({
+    path: 'evidence/05-backoffice/05-inovio-panel-closeup.png',
+  });
   await shot(page, 'inovio-panel');
 
   console.log('BACKOFFICE_ORDER=' + ref);

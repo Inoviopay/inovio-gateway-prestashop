@@ -406,12 +406,67 @@ class Inoviopayment extends PaymentModule
     }
 
     /** Back-office capture/void controls (PrestaShop offers no hook for these). */
+    /**
+     * Handle the panel's Capture / Void submissions.
+     *
+     * The form in order_panel.tpl POSTs back to the order page, so the submit
+     * has to be picked up from a hook that runs on that request. Without this
+     * the buttons render but do nothing — the order sits in "Awaiting capture"
+     * forever with no log line. (Caught by the e2e suite, 2026-08-28.)
+     */
+    private function handleAdminOrderActions(Order $order): ?string
+    {
+        if (!Tools::isSubmit('inovio_capture') && !Tools::isSubmit('inovio_void')) {
+            return null;
+        }
+        if ((int) Tools::getValue('inovio_order_id') !== (int) $order->id) {
+            return null;
+        }
+
+        try {
+            if (Tools::isSubmit('inovio_void')) {
+                $result = InovioGateway::voidOrder($order);
+                $newState = (int) Configuration::get('PS_OS_CANCELED');
+                $ok = $this->trans('Authorization voided.', [], 'Modules.Inoviopayment.Admin');
+            } else {
+                $raw = trim((string) Tools::getValue('inovio_capture_amount'));
+                $amount = $raw === '' ? null : number_format((float) $raw, 2, '.', '');
+                $result = InovioGateway::captureOrder($order, $amount);
+                $newState = (int) Configuration::get('PS_OS_PAYMENT');
+                $ok = $this->trans('Payment captured.', [], 'Modules.Inoviopayment.Admin');
+            }
+
+            if (!InovioGateway::isApproved($result)) {
+                return $this->displayError(
+                    (string) (InovioGateway::advice($result)
+                        ?? $this->trans('The gateway declined the request.', [], 'Modules.Inoviopayment.Admin'))
+                );
+            }
+
+            $history = new OrderHistory();
+            $history->id_order = (int) $order->id;
+            $history->changeIdOrderState($newState, (int) $order->id);
+            $history->add();
+
+            return $this->displayConfirmation($ok);
+        } catch (\Throwable $e) {
+            InovioGateway::log('admin action failed on order ' . (int) $order->id . ': ' . $e->getMessage(), true);
+
+            return $this->displayError($e->getMessage());
+        }
+    }
+
     public function hookDisplayAdminOrderMainBottom(array $params): string
     {
         $order = new Order((int) ($params['id_order'] ?? 0));
         if (!Validate::isLoadedObject($order) || $order->module !== $this->name) {
             return '';
         }
+
+        // Act on a Capture/Void submit before rendering, so the panel below
+        // reflects the new state in the same request.
+        $notice = (string) $this->handleAdminOrderActions($order);
+        $order = new Order((int) $order->id);
 
         $awaitingCapture = (int) Configuration::getGlobalValue(self::STATE_AWAITING_CAPTURE);
         $this->context->smarty->assign([
@@ -422,7 +477,7 @@ class Inoviopayment extends PaymentModule
             'inovioAdminToken' => Tools::getAdminTokenLite('AdminOrders'),
         ]);
 
-        return $this->fetch('module:' . $this->name . '/views/templates/admin/order_panel.tpl');
+        return $notice . $this->fetch('module:' . $this->name . '/views/templates/admin/order_panel.tpl');
     }
 
     // --------------------------------------------------------------- config UI
