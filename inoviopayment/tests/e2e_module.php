@@ -1,4 +1,5 @@
 <?php
+if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 require_once "/var/www/html/config/config.inc.php";
 require_once "/var/www/html/modules/inoviopayment/vendor/inovio/autoload.php";
 require_once "/var/www/html/modules/inoviopayment/classes/InovioGateway.php";
@@ -63,7 +64,14 @@ $card = InovioVault::saveFromResult((int)$customer->id,1,$res,"122030","VI","111
 printf("vault: %s\n", $card ? "saved id={$card->id} ".$card->getMaskedNumber()." ".$card->getExpiryLabel() : "NOT SAVED");
 printf("vault list count=%d\n", count(InovioStoredCard::getByCustomer((int)$customer->id,1)));
 
-// Refund through the module (settlement-aware).
-$rf = InovioGateway::refundOrder($order, "5.00");
-printf("module refund: %s amt=%s %s\n",$rf->status,$rf->amount?->amount()??"-",InovioGateway::advice($rf)??"");
+// Refund through the module (CREDIT_ON_FAIL contract). A partial refund
+// throws when the gateway reports SERVICE_NOT_SETTLED (536); that throw is
+// the expected diagnostic signal in sandbox, where the sale has typically
+// not settled yet, so it is reported rather than retried as a full refund.
+try {
+    $rf = InovioGateway::refundOrderPartial($order, "5.00");
+    printf("module partial refund: %s amt=%s\n", $rf->status, $rf->amount?->amount() ?? "-");
+} catch (\Throwable $e) {
+    printf("module partial refund EXCEPTION: %s\n", $e->getMessage());
+}
 echo "ORDER_ID=".$order->id." CUSTOMER_ID=".$customer->id."\n";

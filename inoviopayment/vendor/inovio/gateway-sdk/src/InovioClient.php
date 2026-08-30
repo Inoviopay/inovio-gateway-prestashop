@@ -128,20 +128,45 @@ final class InovioClient
         ]));
     }
 
-    /** CCREVERSE — void the original authorization. */
-    public function reverse(OrderRef $order): TransactionResult
+    /**
+     * CCREVERSE — void the original authorization.
+     *
+     * With $creditOnFail the gateway sends CREDIT_ON_FAIL=1 (spec §5.4.2): if
+     * the transaction is already settled and cannot be reversed, the gateway
+     * itself re-routes the request to CCCREDIT. The response then carries
+     * REQUEST_ACTION=CCCREDIT instead of CCREVERSE.
+     */
+    public function reverse(OrderRef $order, bool $creditOnFail = false): TransactionResult
     {
         return ResultMapper::toTransactionResult(
-            $this->call('CCREVERSE', ['REQUEST_REF_PO_ID' => $order->poId()])
+            $this->call('CCREVERSE', self::reversalParams($order, $creditOnFail))
         );
     }
 
-    /** CCREVERSECAP — void a CCCAPTURE (not the original auth). */
-    public function reverseCapture(OrderRef $order): TransactionResult
+    /**
+     * CCREVERSECAP — void a CCCAPTURE (not the original auth).
+     *
+     * $creditOnFail behaves exactly as on reverse(): the gateway's reversal
+     * handling is shared between CCREVERSE and CCREVERSECAP, so a settled
+     * capture is re-routed to CCCREDIT gateway-side and the response comes
+     * back as CCCREDIT.
+     */
+    public function reverseCapture(OrderRef $order, bool $creditOnFail = false): TransactionResult
     {
         return ResultMapper::toTransactionResult(
-            $this->call('CCREVERSECAP', ['REQUEST_REF_PO_ID' => $order->poId()])
+            $this->call('CCREVERSECAP', self::reversalParams($order, $creditOnFail))
         );
+    }
+
+    /** @return array<string,string> */
+    private static function reversalParams(OrderRef $order, bool $creditOnFail): array
+    {
+        $p = ['REQUEST_REF_PO_ID' => $order->poId()];
+        if ($creditOnFail) {
+            $p['CREDIT_ON_FAIL'] = '1';
+        }
+
+        return $p;
     }
 
     /** CCCREDIT — refund against an existing order. Partial-capable. */

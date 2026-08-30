@@ -1,4 +1,5 @@
 <?php
+if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 /**
  * Module-level e2e: exercises the module's OWN code paths (InovioGateway,
  * InovioVault, custom order states, validateOrder) against a live gateway —
@@ -66,5 +67,17 @@ printf("C1 sale+vault     order=%d card=%s\n",$o3->id,$card?"id=".$card->id:"NOT
 printf("C2 saved-card     %s order=%s\n",$r4->status,$o4?$o4->id:"-");
 [$c5,$u5]=newCart($ctx); [$o5,]=place($c5,$u5,$tok(),"authorize",$m);
 printf("D  partial cap    %s amt=%s\n",($x=InovioGateway::captureOrder($o5,"5.00"))->status,$x->amount?->amount()??"-");
-printf("E  module refund  %s amt=%s\n",($y=InovioGateway::refundOrder($o3,"5.00"))->status,$y->amount?->amount()??"-");
+// E1: partial refund on o3 (sale — captured but, in sandbox, typically not yet
+// settled). InovioGateway::refundOrderPartial() throws when the gateway
+// answers SERVICE_NOT_SETTLED (536); that throw IS the expected diagnostic
+// signal here, so it is reported rather than retried as a full refund.
+try {
+  $y=InovioGateway::refundOrderPartial($o3,"5.00");
+  printf("E1 partial refund %s amt=%s\n",$y->status,$y->amount?->amount()??"-");
+} catch (\Throwable $e) {
+  printf("E1 partial refund EXCEPTION: %s\n",$e->getMessage());
+}
+// E2: full refund on o3 — reverseCapture(creditOnFail: true) handles both the
+// unsettled (reverse) and settled (auto-credit) cases gateway-side.
+printf("E2 full refund    %s amt=%s\n",($z=InovioGateway::refundOrderFull($o3))->status,$z->amount?->amount()??"-");
 Configuration::updateValue("INOVIOPAYMENT_PAYMENT_ACTION","sale");

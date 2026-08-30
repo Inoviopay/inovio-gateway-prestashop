@@ -22,8 +22,8 @@ class InoviopaymentSignatureModuleFrontController extends ModuleFrontController
     {
         header('Content-Type: application/json');
 
-        // (1) Same-origin: a valid PrestaShop token must accompany the call.
-        if (!hash_equals(Tools::getToken(false), (string) Tools::getValue('inovio_token'))) {
+        // (1) Same-origin: a valid per-visitor nonce must accompany the call.
+        if (!$this->module->verifyCsrfToken((string) Tools::getValue('inovio_token'))) {
             $this->fail('invalid_token');
         }
 
@@ -33,8 +33,9 @@ class InoviopaymentSignatureModuleFrontController extends ModuleFrontController
             $this->fail('no_cart');
         }
 
-        // (3) Rate limit per session — a signing endpoint is a minting oracle.
-        if (!$this->withinRateLimit()) {
+        // (3) Server-side rate limit — a signing endpoint is a minting oracle,
+        // and a client-resettable cookie counter is not a real limit.
+        if (!InovioGateway::withinRateLimit('signature', (int) $cart->id, (string) Tools::getRemoteAddr())) {
             $this->fail('rate_limited');
         }
 
@@ -61,25 +62,6 @@ class InoviopaymentSignatureModuleFrontController extends ModuleFrontController
             'tokenUrl' => $this->module->getTokenEndpoint(),
         ]));
         exit;
-    }
-
-    private function withinRateLimit(): bool
-    {
-        $now = time();
-        $window = 60;
-        $max = 12;
-
-        $hits = array_values(array_filter(
-            (array) ($this->context->cookie->inovio_sig_hits ? json_decode($this->context->cookie->inovio_sig_hits, true) : []),
-            static fn($t) => is_numeric($t) && ($now - (int) $t) < $window
-        ));
-        if (count($hits) >= $max) {
-            return false;
-        }
-        $hits[] = $now;
-        $this->context->cookie->inovio_sig_hits = json_encode($hits);
-
-        return true;
     }
 
     private function fail(string $reason): void

@@ -15,12 +15,29 @@ class InoviopaymentThreedsModuleFrontController extends ModuleFrontController
     {
         header('Content-Type: application/json');
 
-        if (!hash_equals(Tools::getToken(false), (string) Tools::getValue('inovio_token'))) {
+        if (!$this->module->verifyCsrfToken((string) Tools::getValue('inovio_token'))) {
             // Log it: a silent refusal here means the 3DS block never gets
             // attached and the transaction quietly proceeds WITHOUT 3DS.
             InovioGateway::log('3DS prepare refused: invalid_token', true);
             http_response_code(403);
             $this->ajaxRender((string) json_encode(['error' => 'invalid_token']));
+            exit;
+        }
+
+        // prepare() needs the transaction currency and the billing country,
+        // and the rate limiter below needs the cart id — load it first.
+        $cart = $this->context->cart;
+        if (!Validate::isLoadedObject($cart)) {
+            $this->ajaxRender((string) json_encode([]));
+            exit;
+        }
+
+        // Every hit here is a paid gateway call — same server-side limit as
+        // the signing endpoint, keyed separately so the two budgets don't share.
+        if (!InovioGateway::withinRateLimit('threeds', (int) $cart->id, (string) Tools::getRemoteAddr())) {
+            InovioGateway::log('3DS prepare rate limited', true);
+            http_response_code(429);
+            $this->ajaxRender((string) json_encode(['error' => 'rate_limited']));
             exit;
         }
 
@@ -30,12 +47,6 @@ class InoviopaymentThreedsModuleFrontController extends ModuleFrontController
             exit;
         }
 
-        // prepare() needs the transaction currency and the billing country.
-        $cart = $this->context->cart;
-        if (!Validate::isLoadedObject($cart)) {
-            $this->ajaxRender((string) json_encode([]));
-            exit;
-        }
         $currency = new Currency((int) $cart->id_currency);
         $billing = new Address((int) $cart->id_address_invoice);
         $country = Validate::isLoadedObject($billing)

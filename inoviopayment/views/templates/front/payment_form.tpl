@@ -43,7 +43,7 @@
         {l s='Card number' d='Modules.Inoviopayment.Shop'}
       </label>
       <div class="col-md-8">
-        <input type="text" id="inovio_card_number" name="inovio_card_number" class="form-control"
+        <input type="text" id="inovio_card_number" class="form-control"
                inputmode="numeric" autocomplete="cc-number" maxlength="23" placeholder="•••• •••• •••• ••••">
       </div>
     </div>
@@ -73,7 +73,7 @@
         {l s='Security code' d='Modules.Inoviopayment.Shop'}
       </label>
       <div class="col-md-8">
-        <input type="text" id="inovio_cvv" name="inovio_cvv" class="form-control"
+        <input type="text" id="inovio_cvv" class="form-control"
                inputmode="numeric" autocomplete="cc-csc" maxlength="4" placeholder="•••">
       </div>
     </div>

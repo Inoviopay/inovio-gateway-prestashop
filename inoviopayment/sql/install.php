@@ -46,6 +46,20 @@ $sql[] = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'inovio_order_ref` (
     PRIMARY KEY (`id_order`, `ref_key`)
 ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;';
 
+/*
+ * Server-side rate-limit hits for the signing (signature.php) and 3DS
+ * prepare (threeds.php) endpoints — both are paid/mintable gateway calls
+ * and must not be throttled by a client-resettable cookie. Keyed by
+ * cart id + IP + endpoint; pruned on every write (see InovioGateway::withinRateLimit()).
+ */
+$sql[] = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'inovio_rate_limit_hit` (
+    `id_inovio_rate_limit_hit` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `rl_key` VARCHAR(64) NOT NULL,
+    `date_add` DATETIME NOT NULL,
+    PRIMARY KEY (`id_inovio_rate_limit_hit`),
+    KEY `idx_inovio_rate_limit_hit_key` (`rl_key`, `date_add`)
+) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;';
+
 foreach ($sql as $query) {
     if (Db::getInstance()->execute($query) === false) {
         return false;

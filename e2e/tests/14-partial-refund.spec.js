@@ -13,13 +13,26 @@ const ADMIN_DIR = process.env.PS_ADMIN_DIR || 'admin6559ig9pytkodet9x6f';
  * strictly smaller quantity so the resulting credit slip is genuinely
  * partial.
  *
- * The module hooks actionProductCancel for both STANDARD_REFUND and
- * PARTIAL_REFUND action types (see hookActionProductCancel /
- * refundAmount() in inoviopayment.php) — refundAmount() sums
- * unit_price_tax_incl * quantity across only the order-detail rows/
- * quantities present in cancel_quantity, so a partial selection here
- * exercises that summation path specifically (refundAmount() returns null,
- * meaning "full refund", only when cancel_quantity is empty/absent).
+ * The module hooks actionOrderSlipAdd (one invocation per refund operation,
+ * carrying the created credit slip). A slip smaller than the order's total
+ * paid routes to a gateway CCCREDIT for exactly the slip amount — and the
+ * gateway REFUSES a credit on an order that has not settled (service 536),
+ * which the module surfaces as a loud error instead of silently reversing
+ * the whole capture (the old bug). So this spec runs in two phases:
+ *
+ *   A. Pre-settlement: the partial refund must FAIL VISIBLY in the back
+ *      office, with no gateway money movement.
+ *   B. The capture is marked settled in the GATEWAY's database (settlement
+ *      is an acquirer batch process with no UI anywhere — flipping
+ *      trans_settled on the gateway side simulates the acquirer, not the
+ *      shop; every shop interaction stays real UI). The same partial
+ *      refund then succeeds as a gateway CCCREDIT for the slip amount.
+ *
+ * Known PS9 core caveat (verified in OrderSlipCreator::create): the credit
+ * slip row is committed BEFORE actionOrderSlipAdd fires, so phase A leaves
+ * an orphan slip on record even though the gateway refused the refund. The
+ * module cannot prevent that from inside the hook; the loud error is the
+ * merchant's signal that no money moved.
  */
 function dbQuery(sql) {
   return execSync(
@@ -96,18 +109,55 @@ test('Refund PART of a multi-quantity Sale order from the back office', async ({
   const partialAmountStr = await amountInput.inputValue();
   await shot(page, 'partial-quantity-selected');
 
-  // Save. Real form POST (form[name="cancel_product"]).
+  // --- Phase A: pre-settlement, the partial refund must fail loudly. ------
   await page.locator('#cancel_product_save').click();
   await page.waitForLoadState('networkidle');
-  await shot(page, 'after-partial-refund-submit');
+  await shot(page, 'phaseA-presettlement-refused');
+
+  // The back office must SHOW an error — the silent-full-reversal era is over.
+  await expect(page.locator('body')).toContainText(/error|not settled/i);
+
+  const phaseALog = dbQuery(
+    "SELECT message FROM ps_log WHERE message LIKE '%inovio%' ORDER BY id_log DESC LIMIT 3;"
+  );
+  console.log('phase A module log:\n' + phaseALog);
+  expect(phaseALog).toMatch(/not settled/i);
+  expect(phaseALog).toMatch(/refundOrderPartial .*FAILED/i);
+
+  // --- Phase B: settle the capture gateway-side, then the same partial
+  // refund succeeds as a CCCREDIT. -----------------------------------------
+  const poId = dbQuery(
+    `SELECT ref_value FROM ps_inovio_order_ref WHERE id_order=${idOrder} AND ref_key='po_id';`
+  );
+  expect(poId).toMatch(/^\d+$/);
+  console.log('gateway PO_ID=' + poId + ' — marking settled (simulated acquirer batch)');
+  const settleOut = execSync(
+    `docker --context desktop-linux exec inovio-oracle bash -c "printf 'UPDATE pmt.transaction SET trans_settled=1 WHERE po_id=${poId};\\nCOMMIT;\\n' | sqlplus -s \\"sys/Oracle21c!@//localhost:1521/ORCLPDB1 as sysdba\\"" `
+  ).toString();
+  console.log('settle output: ' + settleOut.trim());
+  expect(settleOut).toMatch(/row updated/i);
+
+  await admin.openOrder(page, ADMIN_DIR, ref);
+  await page.locator('button.partial-refund-display').click();
+  const qtyInput2 = page.locator('input[id^="cancel_product_quantity_"]').first();
+  await expect(qtyInput2).toBeVisible();
+  await qtyInput2.fill(PARTIAL_QTY);
+  await qtyInput2.dispatchEvent('change');
+  await expect(page.locator('input[id^="cancel_product_amount_"]').first()).not.toHaveValue('0.00');
+  await shot(page, 'phaseB-partial-selected');
+
+  await page.locator('#cancel_product_save').click();
+  await page.waitForLoadState('networkidle');
+  await shot(page, 'phaseB-after-partial-refund-submit');
 
   await expect(page.locator('body')).not.toContainText(/error occurred|An error/i);
 
-  // A credit slip must be generated, same as the full-refund case.
+  // A credit slip must be listed (phase A's orphan slip may also be there —
+  // the PS core caveat in the header — so assert presence, not an exact count).
   await page.locator('#orderDocumentsTab').click();
   const docsTab = page.locator('#orderDocumentsTabContent');
   await expect(docsTab).toContainText(/Credit slip/i, { timeout: 30000 });
-  await expect(docsTab.locator('a[href*="generateOrderSlipPDF"]')).toHaveCount(1);
+  expect(await docsTab.locator('a[href*="generateOrderSlipPDF"]').count()).toBeGreaterThan(0);
   await shot(page, 'partial-refund-recorded');
 
   // --- Read-only DB verification -----------------------------------------
@@ -128,20 +178,20 @@ test('Refund PART of a multi-quantity Sale order from the back office', async ({
     `(${totalPaid}) for a partial refund of qty ${PARTIAL_QTY} of ${maxQty}.`
   ).toBeLessThan(totalPaid);
 
-  // product_quantity_refunded on the order line should now be 1, not 2.
+  // At least one unit is recorded refunded, never the full quantity (phase
+  // A's aborted attempt may or may not have advanced this counter depending
+  // on where PS's command aborted — the phase-B refund definitely did).
   const qtyRefunded = dbQuery(
     `SELECT product_quantity_refunded FROM ps_order_detail WHERE id_order=${idOrder} LIMIT 1;`
   );
   console.log('product_quantity_refunded =', qtyRefunded);
-  expect(parseInt(qtyRefunded, 10)).toBe(1);
+  expect(parseInt(qtyRefunded, 10)).toBeGreaterThanOrEqual(1);
+  expect(parseInt(qtyRefunded, 10)).toBeLessThan(parseInt(maxQty, 10));
 
-  // Confirm the module actually fired for this refund (hookActionProductCancel
-  // -> InovioGateway refund/reverseCapture) by reading its own log line —
-  // read-only verification, not a substitute for the UI-driven assertions
-  // above.
+  // The phase-B partial went through as an approved gateway CCCREDIT.
   const logLines = dbQuery(
     "SELECT message FROM ps_log WHERE message LIKE '%inovio%' ORDER BY id_log DESC LIMIT 5;"
   );
   console.log('recent ps_log inovio lines:\n' + logLines);
-  expect(logLines.toLowerCase()).toMatch(/refund|reversecapture|capture/);
+  expect(logLines).toMatch(/refundOrderPartial .*APPROVED/i);
 });

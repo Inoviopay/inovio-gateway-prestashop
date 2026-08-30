@@ -101,14 +101,14 @@ async function cartTotal(page) {
 /** Fill the card form directly (bypassing ck.fillCard's fixed-valid values) and submit. */
 async function submitCard(page, { pan, month, year, cvv }) {
   const form = page.locator('#inovio-payment-form');
-  await form.locator('[name="inovio_card_number"]').fill(pan);
+  await form.locator('#inovio_card_number').fill(pan);
   if (month) {
     await form.locator('[name="inovio_exp_month"]').selectOption(month);
   }
   if (year) {
     await form.locator('[name="inovio_exp_year"]').selectOption(year);
   }
-  await form.locator('[name="inovio_cvv"]').fill(cvv);
+  await form.locator('#inovio_cvv').fill(cvv);
   await ck.acceptTerms(page);
   await ck.placeOrder(page);
 }

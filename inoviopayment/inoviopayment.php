@@ -20,8 +20,13 @@ class Inoviopayment extends PaymentModule
     /** Order states this module creates at install (PrestaShop has none for these). */
     public const STATE_AWAITING_3DS = 'INOVIOPAYMENT_OS_AWAITING_3DS';
     public const STATE_AWAITING_CAPTURE = 'INOVIOPAYMENT_OS_AWAITING_CAPTURE';
+    /** A gateway PENDING/RUNNING result outside the 3DS challenge flow — e.g. an async processor. */
+    public const STATE_PAYMENT_PENDING = 'INOVIOPAYMENT_OS_PAYMENT_PENDING';
 
     public const PRODUCTION_ENDPOINT = 'https://api.inoviopay.com/payment/pmt_service.cfm';
+
+    /** Cookie key for the per-visitor CSRF nonce (see csrfToken()). */
+    private const CSRF_COOKIE_KEY = 'inovio_csrf';
 
     /** @var string[] */
     public $configKeys = [
@@ -44,7 +49,7 @@ class Inoviopayment extends PaymentModule
     {
         $this->name = 'inoviopayment';
         $this->tab = 'payments_gateways';
-        $this->version = '1.0.0';
+        $this->version = '1.0.1';
         $this->author = 'Inovio Payments';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '9.0.0', 'max' => _PS_VERSION_];
@@ -71,8 +76,12 @@ class Inoviopayment extends PaymentModule
     public function install(): bool
     {
         if (!extension_loaded('bcmath')) {
+            // The requirement is correct — the vendored SDK's ResultMapper
+            // uses bcadd() to sum leg amounts — but the module itself does
+            // no arbitrary-precision arithmetic of its own; it is a
+            // dependency of the SDK, not of this module's code.
             $this->_errors[] = $this->trans(
-                'The bcmath PHP extension is required (payment amounts are computed without binary floats).',
+                'The bcmath PHP extension is required by the Inovio gateway SDK.',
                 [],
                 'Modules.Inoviopayment.Admin'
             );
@@ -83,10 +92,11 @@ class Inoviopayment extends PaymentModule
         return parent::install()
             && $this->installSql()
             && $this->installOrderStates()
+            && $this->installTabs()
             && $this->registerHook('paymentOptions')
             && $this->registerHook('paymentReturn')
             && $this->registerHook('actionFrontControllerSetMedia')
-            && $this->registerHook('actionProductCancel')
+            && $this->registerHook('actionOrderSlipAdd')
             && $this->registerHook('displayCustomerAccount')
             && $this->registerHook('displayAdminOrderMainBottom')
             && $this->setDefaults();
@@ -98,7 +108,39 @@ class Inoviopayment extends PaymentModule
             Configuration::deleteByName($key);
         }
 
-        return $this->uninstallSql() && parent::uninstall();
+        return $this->uninstallTabs() && $this->uninstallSql() && parent::uninstall();
+    }
+
+    /**
+     * AdminInovioOrderActionsController (capture/void) has no menu entry —
+     * it is invisible, POST-only, reached from the order panel's own form.
+     */
+    public function installTabs(): bool
+    {
+        if ((int) Tab::getIdFromClassName('AdminInovioOrderActions') > 0) {
+            return true;
+        }
+
+        $tab = new Tab();
+        $tab->class_name = 'AdminInovioOrderActions';
+        $tab->module = $this->name;
+        $tab->id_parent = -1;
+        $tab->active = true;
+        $tab->name = array_fill_keys(Language::getIDs(false), 'Inovio Order Actions');
+
+        return (bool) $tab->add();
+    }
+
+    public function uninstallTabs(): bool
+    {
+        $idTab = (int) Tab::getIdFromClassName('AdminInovioOrderActions');
+        if ($idTab <= 0) {
+            return true;
+        }
+
+        $tab = new Tab($idTab);
+
+        return (bool) $tab->delete();
     }
 
     private function installSql(): bool
@@ -123,11 +165,12 @@ class Inoviopayment extends PaymentModule
     }
 
     /**
-     * PrestaShop has no pending-authentication or awaiting-capture state, so
-     * the module creates its own. Both are unpaid and non-loggable: an order
-     * sitting in them must not count as revenue.
+     * PrestaShop has no pending-authentication, awaiting-capture, or
+     * generic-pending state, so the module creates its own. All three are
+     * unpaid and non-loggable: an order sitting in them must not count as
+     * revenue.
      */
-    private function installOrderStates(): bool
+    public function installOrderStates(): bool
     {
         $states = [
             self::STATE_AWAITING_3DS => [
@@ -137,6 +180,10 @@ class Inoviopayment extends PaymentModule
             self::STATE_AWAITING_CAPTURE => [
                 'name' => 'Awaiting capture (Inovio)',
                 'color' => '#FF8C00',
+            ],
+            self::STATE_PAYMENT_PENDING => [
+                'name' => 'Payment pending (Inovio)',
+                'color' => '#DAA520',
             ],
         ];
 
@@ -167,6 +214,41 @@ class Inoviopayment extends PaymentModule
         }
 
         return true;
+    }
+
+    /**
+     * Per-visitor CSRF nonce for the module's own front controllers
+     * (signature.php, threeds.php, validation.php).
+     *
+     * Tools::getToken(false) is a SHOP-WIDE constant for guests — identical
+     * for every anonymous visitor, so a guest can read it once and use it as
+     * a standing card-testing oracle against signature.php. This nonce is
+     * instead random per visitor and stored server-side in the PrestaShop
+     * cookie, which is Blowfish-signed server-side: the value a visitor's
+     * browser holds cannot be forged or predicted, only echoed back.
+     *
+     * Reused for the lifetime of the cookie session rather than regenerated
+     * per render, so a page held open across multiple AJAX calls (signature,
+     * then 3DS prepare, then validation submit) keeps working.
+     */
+    public function csrfToken(): string
+    {
+        $existing = (string) ($this->context->cookie->{self::CSRF_COOKIE_KEY} ?? '');
+        if ($existing !== '' && preg_match('/^[a-f0-9]{32}$/', $existing)) {
+            return $existing;
+        }
+
+        $token = bin2hex(random_bytes(16));
+        $this->context->cookie->{self::CSRF_COOKIE_KEY} = $token;
+
+        return $token;
+    }
+
+    public function verifyCsrfToken(string $submitted): bool
+    {
+        $stored = (string) ($this->context->cookie->{self::CSRF_COOKIE_KEY} ?? '');
+
+        return $stored !== '' && hash_equals($stored, $submitted);
     }
 
     // ---------------------------------------------------------------- config
@@ -237,15 +319,18 @@ class Inoviopayment extends PaymentModule
             'tokenUrl' => $this->getTokenEndpoint(),
             'threeDsActive' => $this->isThreeDsActive(),
             'vaultActive' => $this->isVaultActive() && (int) $this->context->customer->id > 0,
+            // Keys MUST match what inovio-checkout.js reads (translate() calls
+            // there are the source of truth — do not rename these without
+            // updating the JS too).
             'translations' => [
-                'invalidCard' => $this->trans('Please enter a valid card number.', [], 'Modules.Inoviopayment.Shop'),
-                'invalidExpiry' => $this->trans('Please enter a valid expiration date.', [], 'Modules.Inoviopayment.Shop'),
-                'invalidCvv' => $this->trans('Please enter a valid security code.', [], 'Modules.Inoviopayment.Shop'),
-                'tokenizeFailed' => $this->trans('Card could not be processed. Please try again.', [], 'Modules.Inoviopayment.Shop'),
-                'unreachable' => $this->trans('Could not reach the payment service. Please try again.', [], 'Modules.Inoviopayment.Shop'),
-                'signFailed' => $this->trans('Payment signing failed. Please refresh and try again.', [], 'Modules.Inoviopayment.Shop'),
+                'invalid_card_number' => $this->trans('Please enter a valid card number.', [], 'Modules.Inoviopayment.Shop'),
+                'invalid_expiry' => $this->trans('Please enter a valid expiration date.', [], 'Modules.Inoviopayment.Shop'),
+                'invalid_cvv' => $this->trans('Please enter a valid security code.', [], 'Modules.Inoviopayment.Shop'),
+                'card_failed' => $this->trans('Card could not be processed. Please try again.', [], 'Modules.Inoviopayment.Shop'),
+                'token_service_unreachable' => $this->trans('Could not reach the payment service. Please try again.', [], 'Modules.Inoviopayment.Shop'),
+                'signing_failed' => $this->trans('Payment signing failed. Please refresh and try again.', [], 'Modules.Inoviopayment.Shop'),
                 'processing' => $this->trans('Processing your card…', [], 'Modules.Inoviopayment.Shop'),
-                'authFailed' => $this->trans('Payment authentication failed.', [], 'Modules.Inoviopayment.Shop'),
+                'auth_failed' => $this->trans('Payment authentication failed.', [], 'Modules.Inoviopayment.Shop'),
             ],
         ];
     }
@@ -269,7 +354,6 @@ class Inoviopayment extends PaymentModule
         $option->setModuleName($this->name);
         $option->setCallToActionText($this->trans('Pay by credit card', [], 'Modules.Inoviopayment.Shop'));
         $option->setForm($this->renderPaymentForm());
-        $option->setLogo(Media::getMediaPath(_PS_MODULE_DIR_ . $this->name . '/views/img/cards.png'));
 
         return [$option];
     }
@@ -291,7 +375,7 @@ class Inoviopayment extends PaymentModule
             'inovioThreeDsActive' => $this->isThreeDsActive(),
             'inovioMonths' => range(1, 12),
             'inovioYears' => range((int) date('Y'), (int) date('Y') + 11),
-            'inovioToken' => Tools::getToken(false),
+            'inovioToken' => $this->csrfToken(),
         ]);
 
         return $this->context->smarty->fetch(
@@ -352,12 +436,17 @@ class Inoviopayment extends PaymentModule
     }
 
     /**
-     * Refunds. PrestaShop routes BOTH full and partial refunds through CQRS
-     * commands that surface here, so this single hook covers both.
+     * Refunds. PrestaShop fires this hook exactly ONCE per refund operation
+     * (standard refund, partial refund, or return-product — all three flows
+     * converge on OrderSlipCreator::create()), carrying the OrderSlip that
+     * was just created. That slip's totals are the ONLY correct source for
+     * the refunded amount — do not use actionProductCancel, which fires per
+     * order line with a scalar cancel_quantity and is ALSO fired by
+     * cancel-product flows where no money moves at all.
      *
-     * @param array<string,mixed> $params
+     * @param array<string,mixed> $params ['order' => Order, 'productList' => ..., 'qtyList' => ..., 'orderSlipCreated' => OrderSlip]
      */
-    public function hookActionProductCancel(array $params): void
+    public function hookActionOrderSlipAdd(array $params): void
     {
         if (!isset($params['order']) || !($params['order'] instanceof Order)) {
             return;
@@ -366,115 +455,42 @@ class Inoviopayment extends PaymentModule
         if ($order->module !== $this->name) {
             return;
         }
-
-        // Only act on genuine refund actions, not plain cancellations.
-        $action = $params['action'] ?? null;
-        $isRefund = defined('\PrestaShop\PrestaShop\Core\Domain\Order\CancellationActionType::STANDARD_REFUND')
-            ? in_array($action, [
-                \PrestaShop\PrestaShop\Core\Domain\Order\CancellationActionType::STANDARD_REFUND,
-                \PrestaShop\PrestaShop\Core\Domain\Order\CancellationActionType::PARTIAL_REFUND,
-            ], true)
-            : $action !== null;
-        if (!$isRefund) {
+        $slip = $params['orderSlipCreated'] ?? null;
+        if (!($slip instanceof OrderSlip)) {
             return;
         }
 
+        $slipAmount = number_format(
+            (float) $slip->total_products_tax_incl + (float) $slip->total_shipping_tax_incl,
+            2,
+            '.',
+            ''
+        );
+
+        $priorSlipCount = (int) Db::getInstance()->getValue(
+            'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'order_slip` WHERE `id_order` = ' . (int) $order->id
+        );
+        $isFull = $priorSlipCount <= 1 && $slipAmount === number_format((float) $order->total_paid, 2, '.', '');
+
         try {
-            InovioGateway::refundOrder($order, $this->refundAmount($order, $params));
+            if ($isFull) {
+                InovioGateway::refundOrderFull($order);
+            } else {
+                InovioGateway::refundOrderPartial($order, $slipAmount);
+            }
         } catch (\Throwable $e) {
             InovioGateway::log('refund failed for order ' . (int) $order->id . ': ' . $e->getMessage(), true);
+
+            throw $e;
         }
     }
 
-    /** @param array<string,mixed> $params */
-    private function refundAmount(Order $order, array $params): ?string
-    {
-        $refunds = $params['cancel_quantity'] ?? null;
-        if (!is_array($refunds) || $refunds === []) {
-            return null; // full refund
-        }
-
-        $total = 0.0;
-        foreach ($refunds as $idOrderDetail => $quantity) {
-            $detail = new OrderDetail((int) $idOrderDetail);
-            if (Validate::isLoadedObject($detail)) {
-                $total += (float) $detail->unit_price_tax_incl * (int) $quantity;
-            }
-        }
-
-        return $total > 0 ? number_format($total, 2, '.', '') : null;
-    }
-
-    /** Back-office capture/void controls (PrestaShop offers no hook for these). */
     /**
-     * Handle the panel's Capture / Void submissions.
-     *
-     * The form in order_panel.tpl POSTs back to the order page, so the submit
-     * has to be picked up from a hook that runs on that request. Without this
-     * the buttons render but do nothing — the order sits in "Awaiting capture"
-     * forever with no log line. (Caught by the e2e suite, 2026-08-28.)
+     * Back-office capture/void controls (PrestaShop offers no hook for
+     * these). Capture and void are POSTed to AdminInovioOrderActionsController
+     * (registered as a tab in install()); this hook only renders the panel
+     * and any notice/error the controller redirected back with.
      */
-    private function handleAdminOrderActions(Order $order): ?string
-    {
-        if (!Tools::isSubmit('inovio_capture') && !Tools::isSubmit('inovio_void')) {
-            return null;
-        }
-        if ((int) Tools::getValue('inovio_order_id') !== (int) $order->id) {
-            return null;
-        }
-
-        try {
-            if (Tools::isSubmit('inovio_void')) {
-                $result = InovioGateway::voidOrder($order);
-                $newState = (int) Configuration::get('PS_OS_CANCELED');
-                $ok = $this->trans('Authorization voided.', [], 'Modules.Inoviopayment.Admin');
-            } else {
-                $raw = trim((string) Tools::getValue('inovio_capture_amount'));
-                $amount = $raw === '' ? null : number_format((float) $raw, 2, '.', '');
-                $result = InovioGateway::captureOrder($order, $amount);
-
-                /*
-                 * A PARTIAL capture must leave the order in "Awaiting capture"
-                 * so the remainder can still be taken (design doc §3.1). Only a
-                 * full capture moves it to Payment accepted. Comparing against
-                 * the order total — blank amount means "capture everything".
-                 */
-                $isPartial = $amount !== null
-                    && (float) $amount + 0.001 < (float) $order->total_paid;
-
-                $newState = $isPartial
-                    ? (int) Configuration::getGlobalValue(self::STATE_AWAITING_CAPTURE)
-                    : (int) Configuration::get('PS_OS_PAYMENT');
-                $ok = $isPartial
-                    ? $this->trans('Partial payment captured; the order remains open for the balance.', [], 'Modules.Inoviopayment.Admin')
-                    : $this->trans('Payment captured.', [], 'Modules.Inoviopayment.Admin');
-            }
-
-            if (!InovioGateway::isApproved($result)) {
-                return $this->displayError(
-                    (string) (InovioGateway::advice($result)
-                        ?? $this->trans('The gateway declined the request.', [], 'Modules.Inoviopayment.Admin'))
-                );
-            }
-
-            // A partial capture leaves the order in the state it is already in,
-            // so there is no transition to record — skip the history write
-            // rather than logging a no-op state change.
-            if ($newState !== (int) $order->getCurrentState()) {
-                $history = new OrderHistory();
-                $history->id_order = (int) $order->id;
-                $history->changeIdOrderState($newState, (int) $order->id);
-                $history->add();
-            }
-
-            return $this->displayConfirmation($ok);
-        } catch (\Throwable $e) {
-            InovioGateway::log('admin action failed on order ' . (int) $order->id . ': ' . $e->getMessage(), true);
-
-            return $this->displayError($e->getMessage());
-        }
-    }
-
     public function hookDisplayAdminOrderMainBottom(array $params): string
     {
         $order = new Order((int) ($params['id_order'] ?? 0));
@@ -482,10 +498,7 @@ class Inoviopayment extends PaymentModule
             return '';
         }
 
-        // Act on a Capture/Void submit before rendering, so the panel below
-        // reflects the new state in the same request.
-        $notice = (string) $this->handleAdminOrderActions($order);
-        $order = new Order((int) $order->id);
+        $notice = $this->adminActionNotice();
 
         $awaitingCapture = (int) Configuration::getGlobalValue(self::STATE_AWAITING_CAPTURE);
         $this->context->smarty->assign([
@@ -493,10 +506,36 @@ class Inoviopayment extends PaymentModule
             'inovioCanCapture' => (int) $order->getCurrentState() === $awaitingCapture,
             'inovioPoId' => InovioGateway::getOrderRefValue($order, 'po_id'),
             'inovioTransId' => InovioGateway::getOrderRefValue($order, 'trans_id'),
-            'inovioAdminToken' => Tools::getAdminTokenLite('AdminOrders'),
+            'inovioActionUrl' => $this->context->link->getAdminLink('AdminInovioOrderActions', true),
         ]);
 
         return $notice . $this->fetch('module:' . $this->name . '/views/templates/admin/order_panel.tpl');
+    }
+
+    /** Renders the notice/error code AdminInovioOrderActionsController redirected back with. */
+    private function adminActionNotice(): string
+    {
+        $notices = [
+            'voided' => $this->trans('Authorization voided.', [], 'Modules.Inoviopayment.Admin'),
+            'captured' => $this->trans('Payment captured.', [], 'Modules.Inoviopayment.Admin'),
+            'partial_captured' => $this->trans('Partial payment captured; the order remains open for the balance.', [], 'Modules.Inoviopayment.Admin'),
+            'timeout_reconciled' => $this->trans('The gateway timed out, but the action completed successfully.', [], 'Modules.Inoviopayment.Admin'),
+        ];
+        $errors = [
+            'timeout_unreconciled' => $this->trans('The gateway timed out and no completed action was found. Please check the order status before retrying.', [], 'Modules.Inoviopayment.Admin'),
+        ];
+
+        $notice = (string) Tools::getValue('inovio_notice');
+        if ($notice !== '' && isset($notices[$notice])) {
+            return $this->displayConfirmation($notices[$notice]);
+        }
+
+        $error = (string) Tools::getValue('inovio_error');
+        if ($error !== '') {
+            return $this->displayError($errors[$error] ?? $error);
+        }
+
+        return '';
     }
 
     // --------------------------------------------------------------- config UI

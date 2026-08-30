@@ -243,66 +243,72 @@ class InovioGateway
 
     // --------------------------------------------------------------- verbs
 
-    /**
-     * Undo a captured sale.
-     *
-     * VERIFIED against the gateway (2026-08-28): a refund (CCCREDIT) on an
-     * order that has not settled yet is rejected with SERVICE 536 "Order not
-     * settled: Please reverse". Before settlement the correct undo is
-     * reverseCapture(); refund() only applies once the batch has settled. So
-     * the verb is chosen from the order's settlement state, and a 536 is
-     * retried as a reversal rather than surfaced to the merchant.
-     */
-    public static function refundOrder(Order $order, ?string $amount = null): TransactionResult
-    {
-        $currency = new Currency((int) $order->id_currency);
-        $money = $amount !== null ? Money::of($amount, $currency->iso_code) : null;
-        $ref = self::orderRef($order);
-        $client = self::client();
-
-        if (!self::isSettled($order)) {
-            $result = $client->reverseCapture($ref);
-            self::recordReferences($order, $result);
-            self::log('reverseCapture (unsettled) order ' . (int) $order->id . ' -> ' . $result->status);
-
-            return $result;
-        }
-
-        $result = $client->refund($ref, $money);
-
-        // Settlement can lag our view of it; fall back rather than fail.
-        if ($result->status === 'FAILED' && (int) ($result->outcome->service->code ?? 0) === self::SERVICE_NOT_SETTLED) {
-            self::log('refund returned 536 on order ' . (int) $order->id . '; reversing instead');
-            $result = $client->reverseCapture($ref);
-        }
-
-        self::recordReferences($order, $result);
-        self::log('refund order ' . (int) $order->id . ' -> ' . $result->status);
-
-        return $result;
-    }
-
     /** Gateway service code for "Order not settled: Please reverse". */
     public const SERVICE_NOT_SETTLED = 536;
 
     /**
-     * Whether the gateway order has settled. Asks the gateway rather than
-     * inferring from PrestaShop's order state, which knows nothing of batches.
+     * Undo the full amount of a captured sale.
+     *
+     * Uses reverseCapture() with CREDIT_ON_FAIL=1 (SDK contract): the gateway
+     * itself reverses the authorization if it has not settled, or auto-credits
+     * (CCCREDIT) if it has — the response's action then reflects whichever the
+     * gateway actually performed. There is no settlement pre-check on our
+     * side; the gateway is the sole authority on whether a reversal or a
+     * credit is the correct undo.
+     *
+     * @throws RuntimeException when the result is anything but APPROVED —
+     *         a refund the merchant cannot see the outcome of is worse than
+     *         a loud failure.
      */
-    private static function isSettled(Order $order): bool
+    public static function refundOrderFull(Order $order): TransactionResult
     {
-        try {
-            $status = self::client()->status(self::orderRef($order));
-            foreach ($status->transactions as $leg) {
-                if ($leg->settled) {
-                    return true;
-                }
-            }
-        } catch (\Throwable $e) {
-            self::log('settlement check failed on order ' . (int) $order->id . ': ' . $e->getMessage(), true);
+        $ref = self::orderRef($order);
+        $result = self::client()->reverseCapture($ref, creditOnFail: true);
+        self::recordReferences($order, $result);
+        self::log('refundOrderFull order ' . (int) $order->id . ' -> ' . $result->status);
+
+        if (!self::isApproved($result)) {
+            throw new RuntimeException(
+                'Full refund not approved for order ' . (int) $order->id . ': '
+                . ($result->status . ' ' . (self::advice($result) ?? ''))
+            );
         }
 
-        return false;
+        return $result;
+    }
+
+    /**
+     * Refund a partial amount of a captured sale.
+     *
+     * Partial refunds (CCCREDIT) are only accepted by the gateway once the
+     * original capture has settled — a DECLINED result carrying SERVICE_NOT_SETTLED
+     * (536, "Order not settled: Please reverse") means the merchant must wait
+     * for settlement before a partial refund is possible; there is no
+     * reversal fallback for a partial amount (a reversal is all-or-nothing).
+     *
+     * @throws RuntimeException when the result is anything but APPROVED.
+     */
+    public static function refundOrderPartial(Order $order, string $amount): TransactionResult
+    {
+        $currency = new Currency((int) $order->id_currency);
+        $money = Money::of($amount, $currency->iso_code);
+        $ref = self::orderRef($order);
+        $result = self::client()->refund($ref, $money);
+        self::recordReferences($order, $result);
+        self::log('refundOrderPartial order ' . (int) $order->id . ' -> ' . $result->status);
+
+        if (!self::isApproved($result)) {
+            if ((int) ($result->outcome->service->code ?? 0) === self::SERVICE_NOT_SETTLED) {
+                throw new RuntimeException('order not settled — partial refunds available after settlement');
+            }
+
+            throw new RuntimeException(
+                'Partial refund not approved for order ' . (int) $order->id . ': '
+                . ($result->status . ' ' . (self::advice($result) ?? ''))
+            );
+        }
+
+        return $result;
     }
 
     public static function captureOrder(Order $order, ?string $amount = null): TransactionResult
@@ -347,6 +353,33 @@ class InovioGateway
         return null;
     }
 
+    /**
+     * On a gateway timeout during the 3DS completion leg (or an admin
+     * capture/void), the order already has a PO_ID from the enrollment/prior
+     * leg — reconcile against IT via status() rather than the cart's xtl
+     * reference, looking for an APPROVED completion leg (CCAUTHCAP or
+     * CCAUTHORIZE) before the caller declares failure. Without this, a
+     * timeout on an otherwise-successful completion shows the shopper/merchant
+     * a decline and invites a retry that could double-charge or double-capture.
+     */
+    public static function reconcileOrderTimeout(Order $order, GatewayTimeoutException $e): ?TransactionResult
+    {
+        try {
+            $status = self::client()->status(self::orderRef($order));
+            foreach ($status->transactions as $leg) {
+                if ($leg->status === 'APPROVED' && in_array($leg->action, ['CCAUTHCAP', 'CCAUTHORIZE'], true)) {
+                    self::log('timeout reconciled to APPROVED (' . $leg->action . ') for order ' . (int) $order->id, true);
+
+                    return $leg;
+                }
+            }
+        } catch (\Throwable $statusError) {
+            self::log('order timeout reconcile failed on order ' . (int) $order->id . ': ' . $statusError->getMessage(), true);
+        }
+
+        return null;
+    }
+
     /** Most specific decline advice available. */
     public static function advice(TransactionResult $result): ?string
     {
@@ -360,6 +393,46 @@ class InovioGateway
     public static function isApproved(TransactionResult $result): bool
     {
         return $result->status === 'APPROVED';
+    }
+
+    // ------------------------------------------------------------- rate limit
+
+    /**
+     * Server-side rate limit, shared by signature.php (token signing) and
+     * threeds.php (3DS prepare) — both endpoints trigger a paid gateway call
+     * per hit, so the counter must not live in a client-resettable cookie.
+     *
+     * Keyed by cart id + IP + endpoint so a shared IP (NAT, office) is not
+     * penalized by a different shopper's checkout, and so signing and 3DS
+     * prepare have independent budgets.
+     */
+    public static function withinRateLimit(string $endpoint, int $idCart, string $ip, int $max = 12, int $windowSeconds = 60): bool
+    {
+        $key = pSQL($endpoint . ':' . $idCart . ':' . $ip);
+        $db = Db::getInstance();
+
+        // Prune expired hits for this key before counting — keeps the table
+        // small without a separate cron.
+        $db->execute(
+            'DELETE FROM `' . _DB_PREFIX_ . 'inovio_rate_limit_hit`
+             WHERE `rl_key` = \'' . $key . '\'
+             AND `date_add` < DATE_SUB(NOW(), INTERVAL ' . (int) $windowSeconds . ' SECOND)'
+        );
+
+        $count = (int) $db->getValue(
+            'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'inovio_rate_limit_hit`
+             WHERE `rl_key` = \'' . $key . '\''
+        );
+        if ($count >= $max) {
+            return false;
+        }
+
+        $db->execute(
+            'INSERT INTO `' . _DB_PREFIX_ . 'inovio_rate_limit_hit` (`rl_key`, `date_add`)
+             VALUES (\'' . $key . '\', NOW())'
+        );
+
+        return true;
     }
 
     /** Never logs card data — it never reaches this server. */

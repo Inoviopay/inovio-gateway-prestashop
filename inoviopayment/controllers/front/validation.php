@@ -37,7 +37,7 @@ class InoviopaymentValidationModuleFrontController extends ModuleFrontController
         if ((int) $cart->id_customer !== (int) $this->context->customer->id) {
             $this->redirectWithError('cart_not_owned');
         }
-        if (!hash_equals(Tools::getToken(false), (string) Tools::getValue('inovio_token'))) {
+        if (!$this->module->verifyCsrfToken((string) Tools::getValue('inovio_token'))) {
             $this->redirectWithError('invalid_token');
         }
         // The module must still be an available payment option for this cart.
@@ -123,24 +123,53 @@ class InoviopaymentValidationModuleFrontController extends ModuleFrontController
             ? (float) $result->amount->amount()
             : (float) $cart->getOrderTotal(true, Cart::BOTH);
 
-        if ($result->status === 'PENDING' && $result->nextAction?->kind === 'threeDSChallenge') {
-            $this->createOrder($cart, $customer, Inoviopayment::STATE_AWAITING_3DS, 0.0, $result, $payment);
-            $this->renderChallenge($result);
+        switch ($result->status) {
+            case 'APPROVED':
+                $stateKey = Configuration::get('INOVIOPAYMENT_PAYMENT_ACTION') === 'authorize'
+                    ? Inoviopayment::STATE_AWAITING_CAPTURE
+                    : null; // null => Payment accepted
 
-            return;
+                $order = $this->createOrder($cart, $customer, $stateKey, $amountPaid, $result, $payment);
+                $this->redirectToConfirmation($cart, $customer, $order);
+
+                return;
+
+            case 'PENDING':
+                if ($result->nextAction?->kind === 'threeDSChallenge') {
+                    $this->createOrder($cart, $customer, Inoviopayment::STATE_AWAITING_3DS, 0.0, $result, $payment);
+                    $this->renderChallenge($result);
+
+                    return;
+                }
+                // Any other PENDING (e.g. an async processor with no 3DS
+                // challenge attached) is parked, not declined — the gateway
+                // has not finished deciding, and refs are recorded so the
+                // eventual outcome can be reconciled.
+                InovioGateway::log('cart ' . (int) $cart->id . ' parked PENDING: ' . (InovioGateway::advice($result) ?? 'no advice'));
+                $order = $this->createOrder($cart, $customer, Inoviopayment::STATE_PAYMENT_PENDING, 0.0, $result, $payment);
+                $this->redirectToConfirmation($cart, $customer, $order);
+
+                return;
+
+            case 'RUNNING':
+                // RUNNING is the same "not yet decided" grouping as PENDING
+                // (SDK: TransactionResult::$settling) — park it identically.
+                InovioGateway::log('cart ' . (int) $cart->id . ' parked RUNNING: ' . (InovioGateway::advice($result) ?? 'no advice'));
+                $order = $this->createOrder($cart, $customer, Inoviopayment::STATE_PAYMENT_PENDING, 0.0, $result, $payment);
+                $this->redirectToConfirmation($cart, $customer, $order);
+
+                return;
+
+            case 'DECLINED':
+            case 'FAILED':
+            default:
+                InovioGateway::log('declined cart ' . (int) $cart->id . ': ' . (InovioGateway::advice($result) ?? 'no advice'));
+                $this->redirectWithError('declined', InovioGateway::advice($result));
         }
+    }
 
-        if (!InovioGateway::isApproved($result)) {
-            InovioGateway::log('declined cart ' . (int) $cart->id . ': ' . (InovioGateway::advice($result) ?? 'no advice'));
-            $this->redirectWithError('declined', InovioGateway::advice($result));
-        }
-
-        $stateKey = Configuration::get('INOVIOPAYMENT_PAYMENT_ACTION') === 'authorize'
-            ? Inoviopayment::STATE_AWAITING_CAPTURE
-            : null; // null => Payment accepted
-
-        $order = $this->createOrder($cart, $customer, $stateKey, $amountPaid, $result, $payment);
-
+    private function redirectToConfirmation(Cart $cart, Customer $customer, Order $order): void
+    {
         Tools::redirect($this->context->link->getPageLink('order-confirmation', true, null, [
             'id_cart' => (int) $cart->id,
             'id_module' => (int) $this->module->id,
@@ -190,7 +219,10 @@ class InoviopaymentValidationModuleFrontController extends ModuleFrontController
             );
         }
 
-        // The completion token and challenge data must survive to the ACS return.
+        // The completion token, challenge data, AND the save-card opt-in must
+        // survive to the ACS return — without persisting save_card/cc_brand/
+        // cc_last4 here, a shopper who checked "save this card" loses that
+        // choice silently once the challenge redirects away from this request.
         if ($result->nextAction?->kind === 'threeDSChallenge') {
             InovioGateway::setOrderRefValue($order, 'challenge', (string) json_encode([
                 'procTransId' => $result->nextAction->procTransId ?? '',
@@ -199,6 +231,9 @@ class InoviopaymentValidationModuleFrontController extends ModuleFrontController
             ]));
             InovioGateway::setOrderRefValue($order, 'token_completion', (string) $payment['token_guid_completion']);
             InovioGateway::setOrderRefValue($order, 'pmt_expiry', (string) $payment['pmt_expiry']);
+            InovioGateway::setOrderRefValue($order, 'save_card', $payment['save_card'] ? '1' : '0');
+            InovioGateway::setOrderRefValue($order, 'cc_brand', (string) $payment['cc_brand']);
+            InovioGateway::setOrderRefValue($order, 'cc_last4', (string) $payment['cc_last4']);
         }
 
         return $order;

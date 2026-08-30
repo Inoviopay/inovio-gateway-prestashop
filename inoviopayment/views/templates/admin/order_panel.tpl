@@ -13,7 +13,7 @@
       {l s='Transaction:' d='Modules.Inoviopayment.Admin'} <code>{$inovioTransId|escape:'html':'UTF-8'}</code>
     </p>
     {if $inovioCanCapture}
-      <form method="post" class="form-inline">
+      <form method="post" action="{$inovioActionUrl|escape:'html':'UTF-8'}" class="form-inline">
         <input type="hidden" name="inovio_order_id" value="{$inovioOrderId|intval}">
         <div class="form-group">
           <label class="mr-2">{l s='Amount (blank = full)' d='Modules.Inoviopayment.Admin'}</label>

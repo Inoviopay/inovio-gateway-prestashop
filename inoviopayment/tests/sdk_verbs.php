@@ -1,4 +1,5 @@
 <?php
+if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 require_once "/var/www/html/config/config.inc.php";
 require_once "/var/www/html/modules/inoviopayment/vendor/inovio/autoload.php";
 require_once "/var/www/html/modules/inoviopayment/classes/InovioGateway.php";
@@ -48,8 +49,11 @@ $void = $c->reverse(Refs::order($a2->orderRef->poId())); show("2b void",$void);
 
 // 3. SALE -> REFUND. NOTE: refund() on an UNSETTLED order correctly returns
 // SERVICE 536 "Order not settled: Please reverse" — this raw-SDK script
-// exercises that path deliberately. The module itself uses the
-// settlement-aware InovioGateway::refundOrder(), which reverses instead.
+// exercises that path deliberately. The module itself calls
+// InovioGateway::refundOrderPartial(), which throws a distinct message on
+// that same 536; full refunds instead go through refundOrderFull(), which
+// uses reverseCapture(creditOnFail: true) so the gateway reverses or
+// auto-credits depending on its own settlement state.
 $s3 = $c->sale(req(mintToken(),"40.00")); show("3a sale",$s3);
 $rp = $c->refund(Refs::order($s3->orderRef->poId()), Money::of("15.00","USD")); show("3b refund partial",$rp);
 $rf = $c->refund(Refs::order($s3->orderRef->poId()), Money::of("25.00","USD")); show("3c refund remainder",$rf);

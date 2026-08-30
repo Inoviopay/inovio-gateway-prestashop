@@ -5,17 +5,20 @@ import * as admin from '../lib/admin.js';
 const ADMIN_DIR = process.env.PS_ADMIN_DIR || 'admin6559ig9pytkodet9x6f';
 
 /**
- * Place a normal Sale order, then refund it through PrestaShop's own
+ * Place a normal Sale order, then FULLY refund it through PrestaShop's own
  * back-office refund UI (the "Partial refund" control on the order's
  * Products panel — PS9 only exposes a separate "Standard refund" trigger
  * when the order has already been (partially) refunded once; for a fresh
  * order the single "Partial refund" button IS the standard refund entry
- * point, and selecting the product's full refundable quantity through it
- * is how a merchant fully refunds an order in this UI).
+ * point).
  *
- * The module hooks actionProductCancel for both STANDARD_REFUND and
- * PARTIAL_REFUND action types (see hookActionProductCancel in
- * inoviopayment.php), so this exercises the same code path either way.
+ * The module hooks actionOrderSlipAdd (one invocation per refund operation,
+ * carrying the created credit slip). A refund counts as FULL only when the
+ * slip covers the entire amount paid — products AND shipping — so this spec
+ * refunds the product's full quantity and enters the shipping refund too.
+ * The full path issues a single gateway reverseCapture with CREDIT_ON_FAIL=1:
+ * the GATEWAY reverses the unsettled capture (or auto-credits a settled one);
+ * the module no longer pre-checks settlement or falls back client-side.
  */
 test('Refund a Sale order from the back office', async ({ page }) => {
   const shot = ck.shotter('08-refund');
@@ -62,6 +65,19 @@ test('Refund a Sale order from the back office', async ({ page }) => {
 
   const amountInput = page.locator('input[id^="cancel_product_amount_"]').first();
   await expect(amountInput).not.toHaveValue('0.00');
+
+  // A FULL refund must cover shipping too — the module treats a slip that
+  // equals the order's total paid (products + shipping) as full and issues
+  // a single gateway-side reversal. The shipping field is part of the same
+  // real cancel_product form (CancelProductType::shipping_amount). This
+  // shop ships everything at a flat 5.00, the fallback when PS renders the
+  // field without a max attribute.
+  const shippingInput = page.locator(
+    '#cancel_product_shipping_amount, input[name="cancel_product[shipping_amount]"]'
+  ).first();
+  await expect(shippingInput).toBeVisible();
+  const maxShipping = await shippingInput.getAttribute('max');
+  await shippingInput.fill(maxShipping || '5.00');
   await shot(page, 'product-selected-for-refund');
 
   // Save. This is a real form POST (form[name="cancel_product"], route
@@ -84,4 +100,15 @@ test('Refund a Sale order from the back office', async ({ page }) => {
   await expect(docsTab).toContainText(/Credit slip/i, { timeout: 30000 });
   await expect(docsTab.locator('a[href*="generateOrderSlipPDF"]')).toHaveCount(1);
   await shot(page, 'refund-recorded');
+
+  // Read-only check that the module took the FULL path: one gateway
+  // reverseCapture(creditOnFail) call, approved. (The gateway reverses the
+  // unsettled capture; had it been settled, the same call would come back
+  // re-routed as CCCREDIT — either way a single approved leg.)
+  const { execSync } = await import('node:child_process');
+  const logLine = execSync(
+    `docker --context tensor exec ps-mysql mysql -uprestashop -pprestashop prestashop -N -e "SELECT message FROM ps_log WHERE message LIKE '%refundOrderFull%' ORDER BY id_log DESC LIMIT 1;"`
+  ).toString().trim();
+  console.log('module log: ' + logLine);
+  expect(logLine).toMatch(/refundOrderFull .*APPROVED/i);
 });

@@ -605,10 +605,15 @@
         e.preventDefault();
         clearError();
 
-        var panField = field(form, 'inovio_card_number'),
+        // PAN/CVV carry no name attribute (never POSTed to the shop server,
+        // even if this script fails), so they are looked up by id — scoped to
+        // the submitting form, because the checkout can render the payment
+        // markup more than once and a document-global lookup may hit a
+        // different instance than the one the shopper typed into.
+        var panField = form.querySelector('#inovio_card_number'),
             monthField = field(form, 'inovio_exp_month'),
             yearField = field(form, 'inovio_exp_year'),
-            cvvField = field(form, 'inovio_cvv'),
+            cvvField = form.querySelector('#inovio_cvv'),
             saveCardField = form.querySelector('[name="inovio_save_card_input"]'),
             savedCardRadio = form.querySelector('[name="inovio_saved_card_id"]:checked'),
             submitBtn = findSubmitButton(form),

@@ -11,6 +11,7 @@
  * stored at the enrollment leg.
  */
 
+use Inovio\Gateway\Errors\GatewayTimeoutException;
 use Inovio\Gateway\Model\ThreeDSChallengeResult;
 use Inovio\Gateway\Result\TransactionResult;
 
@@ -51,6 +52,14 @@ class InoviopaymentThreedsreturnModuleFrontController extends ModuleFrontControl
 
         try {
             $result = $this->complete($order, $acsTransId, $pares);
+        } catch (GatewayTimeoutException $e) {
+            $recovered = InovioGateway::reconcileOrderTimeout($order, $e);
+            if ($recovered === null) {
+                InovioGateway::log('3DS completion timeout on order ' . (int) $order->id . ': ' . $e->getMessage(), true);
+                $this->fail($order);
+                $this->respond(false, 'Payment authentication failed.');
+            }
+            $result = $recovered;
         } catch (\Throwable $e) {
             InovioGateway::log('3DS completion failed on order ' . (int) $order->id . ': ' . $e->getMessage(), true);
             $this->fail($order);
@@ -89,9 +98,42 @@ class InoviopaymentThreedsreturnModuleFrontController extends ModuleFrontControl
     {
         InovioGateway::recordReferences($order, $result);
 
-        $state = Configuration::get('INOVIOPAYMENT_PAYMENT_ACTION') === 'authorize'
+        // The save-card opt-in was persisted at the enrollment leg (FIX 6:
+        // it does not survive the ACS redirect any other way). Vault it now,
+        // using THIS completion result — the vault-relevant refs (PMT_ID,
+        // CUST_ID) live on the completion leg, not the enrollment leg.
+        if (InovioGateway::getOrderRefValue($order, 'save_card') === '1'
+            && Configuration::get('INOVIOPAYMENT_VAULT_ACTIVE')
+        ) {
+            InovioVault::saveFromResult(
+                (int) $order->id_customer,
+                (int) $order->id_shop,
+                $result,
+                InovioGateway::getOrderRefValue($order, 'pmt_expiry'),
+                InovioGateway::getOrderRefValue($order, 'cc_brand'),
+                InovioGateway::getOrderRefValue($order, 'cc_last4')
+            );
+        }
+
+        $isAuthorizeOnly = Configuration::get('INOVIOPAYMENT_PAYMENT_ACTION') === 'authorize';
+        $state = $isAuthorizeOnly
             ? (int) Configuration::getGlobalValue(Inoviopayment::STATE_AWAITING_CAPTURE)
             : (int) Configuration::get('PS_OS_PAYMENT');
+
+        // The order was created at the enrollment leg with amountPaid = 0.0
+        // (no money had moved yet). A "sale" completion (CCAUTHCAP) DOES move
+        // money now — record it, using the completion result's own amount,
+        // not the cart total, per the same Addons rule the rest of this
+        // module follows (the amount comes from the gateway). An
+        // "authorize"-only completion still has not captured anything, so no
+        // payment is recorded here; that happens at capture time instead.
+        if (!$isAuthorizeOnly && $result->amount !== null) {
+            $order->addOrderPayment(
+                (float) $result->amount->amount(),
+                null,
+                $result->transactionId?->value()
+            );
+        }
 
         $history = new OrderHistory();
         $history->id_order = (int) $order->id;

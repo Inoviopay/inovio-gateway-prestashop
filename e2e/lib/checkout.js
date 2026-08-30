@@ -148,10 +148,10 @@ export async function selectInovio(page) {
 /** Type the card exactly as a shopper does. */
 export async function fillCard(page, pan, { save = false, month = '12', year = '2030', cvv = '123' } = {}) {
   const form = page.locator('#inovio-payment-form');
-  await form.locator('[name="inovio_card_number"]').fill(pan);
+  await form.locator('#inovio_card_number').fill(pan);
   await form.locator('[name="inovio_exp_month"]').selectOption(month);
   await form.locator('[name="inovio_exp_year"]').selectOption(year);
-  await form.locator('[name="inovio_cvv"]').fill(cvv);
+  await form.locator('#inovio_cvv').fill(cvv);
 
   if (save) {
     await form.locator('[name="inovio_save_card_input"]').check();
