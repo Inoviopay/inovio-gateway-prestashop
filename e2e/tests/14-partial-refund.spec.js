@@ -131,8 +131,11 @@ test('Refund PART of a multi-quantity Sale order from the back office', async ({
   );
   expect(poId).toMatch(/^\d+$/);
   console.log('gateway PO_ID=' + poId + ' — marking settled (simulated acquirer batch)');
+  // Local-stack SYS credentials come from the environment so they are not
+  // committed; ORACLE_PWD matches stack/docker-compose.yml's default.
+  const oraclePwd = process.env.ORACLE_PWD || 'Oracle21c!';
   const settleOut = execSync(
-    `docker --context desktop-linux exec inovio-oracle bash -c "printf 'UPDATE pmt.transaction SET trans_settled=1 WHERE po_id=${poId};\\nCOMMIT;\\n' | sqlplus -s \\"sys/Oracle21c!@//localhost:1521/ORCLPDB1 as sysdba\\"" `
+    `docker --context desktop-linux exec inovio-oracle bash -c "printf 'UPDATE pmt.transaction SET trans_settled=1 WHERE po_id=${poId};\\nCOMMIT;\\n' | sqlplus -s \\"sys/${oraclePwd}@//localhost:1521/ORCLPDB1 as sysdba\\"" `
   ).toString();
   console.log('settle output: ' + settleOut.trim());
   expect(settleOut).toMatch(/row updated/i);
